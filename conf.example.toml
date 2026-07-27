@@ -1,0 +1,26 @@
+# Example AutoHDR-VK configuration
+# Copy to ~/.config/autohdr-vk/conf.toml
+
+[global]
+# Peak and reference white in nits (match your display HDR calibration when possible)
+reference_nits = 203
+peak_nits = 1000
+black_point = 0.0
+color_intensity = 0.33
+gamut_expansion = 1.5
+highlight_softness = 0.30
+perceptual_color = true
+# linear | balanced | lifted_shadows | soft_shadows | vivid_highlights | high_contrast | exponential | custom
+tone_curve_preset = "balanced"
+# auto | pq | scrgb | sdr_preview
+encoding = "auto"
+set_hdr_metadata = true
+prefer_hdr_swapchain = true
+enabled = true
+
+# Optional per-executable overrides (basename match, case-insensitive)
+# [[profile]]
+# exe = "eldenring.exe"
+# enabled = true
+# peak_nits = 800
+# tone_curve_preset = "vivid_highlights"

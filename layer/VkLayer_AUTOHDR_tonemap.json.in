@@ -1,0 +1,21 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_AUTOHDR_tonemap",
+    "type": "GLOBAL",
+    "library_path": "@AUTOHDR_LAYER_LIBRARY_PATH@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "AutoHDR SDR to HDR tone mapping at present time",
+    "functions": {
+      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
+    },
+    "enable_environment": {
+      "ENABLE_AUTOHDR": "1"
+    },
+    "disable_environment": {
+      "DISABLE_AUTOHDR": "1"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+AutoHDR-VK
+==========
+
+Tone-curve evaluation, preset curves, and core SDR→HDR color processing
+(black point, perceptual luminance remap, gamut expansion helpers) are
+adapted from PlasmaAutoHDR:
+
+  https://github.com/LewisTansley/PlasmaAutoHDR
+
+The Vulkan layer scaffolding, present-time pipeline, TOML configuration,
+and packaging in this repository are original to AutoHDR-VK.
