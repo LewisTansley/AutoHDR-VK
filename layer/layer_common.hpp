@@ -128,12 +128,12 @@ struct ToneParamsUBO {
     float outputMode = 0.0f;
     float inputIsSrgb = 1.0f;
     float intensity = 0.5f;
-    float _pad0 = 0.0f;
+    float ditherStrength = 1.0f;
     float pqBoostParams[4] = {10000.0f, 10000.0f, 1.0f, 0.0f};
     uint32_t extentWidth = 0;
     uint32_t extentHeight = 0;
-    uint32_t _padExtent0 = 0;
-    uint32_t _padExtent1 = 0;
+    uint32_t outputBits = 10;
+    uint32_t _padBits = 0;
 };
 
 // std140 layout — must match shaders/overlay.comp OverlayParams
@@ -347,7 +347,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
                     uint32_t waitCount, const VkSemaphore *waitSemaphores, VkSemaphore &outSignal,
                     bool effectOn, bool drawOverlay);
 void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent);
+                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat);
 void uploadOverlayParams(DeviceData *dev, const OverlayParamsUBO &params);
 
 } // namespace AutoHdrVk

@@ -17,6 +17,8 @@ struct CalibrationSettings {
     float highlightSoftness = 0.30f;
     float intensity = 0.5f; // primary UX: 0 = SDR-like, 1 = full peak effect
     float expansionShape = 0.55f; // 0 = linear, 1 = exponential (darker mids)
+    bool dither = true;
+    float ditherStrength = 1.0f; // 1 = one LSB of output bit depth
     bool perceptualColor = true;
     Vec2 sdrMaxPoint{203.0f, 1000.0f};
     std::vector<Vec2> toneCurvePoints;
@@ -96,6 +98,17 @@ inline float clampHighlightSoftness(float value)
     }
     if (value > 1.0f) {
         return 1.0f;
+    }
+    return value;
+}
+
+inline float clampDitherStrength(float value)
+{
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    if (value > 2.0f) {
+        return 2.0f;
     }
     return value;
 }

@@ -68,6 +68,12 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     if (auto v = table["highlight_softness"].value<double>()) {
         settings.highlightSoftness = AutoHdr::clampHighlightSoftness(static_cast<float>(*v));
     }
+    if (auto v = table["dither"].value<bool>()) {
+        settings.dither = *v;
+    }
+    if (auto v = table["dither_strength"].value<double>()) {
+        settings.ditherStrength = AutoHdr::clampDitherStrength(static_cast<float>(*v));
+    }
     if (auto v = table["perceptual_color"].value<bool>()) {
         settings.perceptualColor = *v;
     }
@@ -94,6 +100,7 @@ void finalizeSettings(AutoHdr::CalibrationSettings &settings)
     settings.expansionShape = AutoHdr::clampExpansionShape(settings.expansionShape);
     settings.gamutExpansion = AutoHdr::clampGamutExpansion(settings.gamutExpansion);
     settings.highlightSoftness = AutoHdr::clampHighlightSoftness(settings.highlightSoftness);
+    settings.ditherStrength = AutoHdr::clampDitherStrength(settings.ditherStrength);
 
     if (settings.toneCurvePreset != AutoHdr::ToneCurvePreset::Custom) {
         AutoHdr::applyToneCurvePreset(settings);

@@ -209,7 +209,7 @@ uint32_t findMemoryType(DeviceData *dev, uint32_t typeBits, VkMemoryPropertyFlag
 }
 
 void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent)
+                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat)
 {
     if (!dev->uboMapped || !dev->lutMapped) {
         return;
@@ -239,6 +239,24 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     }
     std::memcpy(dev->lutMapped, packed, sizeof(packed));
 
+    uint32_t outputBits = 8;
+    switch (swapFormat) {
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
+        outputBits = 10;
+        break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+        outputBits = 16;
+        break;
+    default:
+        outputBits = 8;
+        break;
+    }
+
     ToneParamsUBO ubo{};
     ubo.blackPoint = settings.blackPoint;
     ubo.colorIntensity = std::clamp(settings.colorIntensity, 0.0f, 1.0f);
@@ -251,6 +269,7 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.perceptualColorEnabled = settings.perceptualColor ? 1.0f : 0.0f;
     ubo.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
     ubo.intensity = intensity;
+    ubo.ditherStrength = settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
     switch (encoding) {
     case OutputEncoding::LinearScRgb:
         ubo.outputMode = 1.0f;
@@ -269,6 +288,7 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.pqBoostParams[3] = 0.0f;
     ubo.extentWidth = extent.width;
     ubo.extentHeight = extent.height;
+    ubo.outputBits = outputBits;
     std::memcpy(dev->uboMapped, &ubo, sizeof(ubo));
 
     if (dev->histParamsMapped) {
@@ -1235,7 +1255,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     }
 
     if (effectOn) {
-        uploadToneParams(dev, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent);
+        uploadToneParams(dev, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent, sc.format);
     }
     if (drawOverlay) {
         OverlayParamsUBO overlayUbo{};
@@ -1357,12 +1377,16 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         sc.maskLayout = VK_IMAGE_LAYOUT_GENERAL;
         sc.baseLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        const uint32_t uiGx = (sc.extent.width + 7u) / 8u;
-        const uint32_t uiGy = (sc.extent.height + 7u) / 8u;
-        d.CmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->uiClusterPipeline);
-        d.CmdBindDescriptorSets(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->uiClusterPipelineLayout, 0, 1,
-                                &res.uiClusterSet, 0, nullptr);
-        d.CmdDispatch(res.cmd, uiGx, uiGy, 1);
+        // UI detection temporarily disabled — flip to true to re-enable dispatch.
+        constexpr bool kEnableUiDetection = false;
+        if (kEnableUiDetection) {
+            const uint32_t uiGx = (sc.extent.width + 7u) / 8u;
+            const uint32_t uiGy = (sc.extent.height + 7u) / 8u;
+            d.CmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->uiClusterPipeline);
+            d.CmdBindDescriptorSets(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->uiClusterPipelineLayout, 0, 1,
+                                    &res.uiClusterSet, 0, nullptr);
+            d.CmdDispatch(res.cmd, uiGx, uiGy, 1);
+        }
 
         const uint32_t blurGx = (sc.halfExtent.width + 15u) / 16u;
         const uint32_t blurGy = (sc.halfExtent.height + 15u) / 16u;

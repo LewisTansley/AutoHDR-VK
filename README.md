@@ -102,7 +102,7 @@ Important keys under `[global]`:
 - `prefer_hdr_swapchain` — try to select an HDR10 surface format/colorspace at swapchain create
 - `set_hdr_metadata` — call `vkSetHdrMetadataEXT` when available (maxCLL/maxFALL from scene stats)
 
-Advanced overrides (optional / back-compat): `reference_nits`, `peak_nits`, `tone_curve_preset`, `gamut_expansion` (max expand scale when Color = 1), etc.
+Advanced overrides (optional / back-compat): `reference_nits`, `peak_nits`, `tone_curve_preset`, `gamut_expansion` (max expand scale when Color = 1), `dither` / `dither_strength` (IGN bit-depth dither before swapchain quantize; on by default), etc.
 
 Per-exe overrides:
 

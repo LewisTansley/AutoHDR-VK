@@ -20,6 +20,8 @@ expansion_shape = 0.55
 # highlight_softness = 0.30
 # perceptual_color = true
 # tone_curve_preset = "balanced"
+# dither = true            # bit-depth dither before swapchain quantize (reduces banding)
+# dither_strength = 1.0    # 1 = one LSB of output depth (8/10/16)
 
 # auto | pq | scrgb | sdr_preview
 encoding = "auto"

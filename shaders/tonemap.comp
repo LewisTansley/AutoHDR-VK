@@ -22,10 +22,11 @@ layout(std140, set = 0, binding = 3) uniform ToneParams {
     float outputMode; // 0=pq, 1=scrgb, 2=sdr preview
     float inputIsSrgb;
     float intensity;
-    float _pad0;
+    float ditherStrength; // 0 = off, 1 = one LSB
     vec4 pqBoostParams;
     uvec2 extent;
-    uvec2 _padExtent;
+    uint outputBits; // 8 / 10 / 16 — swapchain quantization depth
+    uint _padBits;
 };
 layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D uOutput;
 layout(std430, set = 0, binding = 5) readonly buffer SceneStatsBlock {
@@ -44,6 +45,21 @@ layout(std430, set = 0, binding = 5) readonly buffer SceneStatsBlock {
 } sceneStats;
 
 #include "tonemap_color.glsl"
+
+float interleavedGradientNoise(vec2 p)
+{
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+vec3 applyBitDepthDither(vec3 color, uvec2 pixel, float strength, uint bits)
+{
+    if (strength <= 0.0 || bits < 2u) {
+        return color;
+    }
+    float levels = float((1u << bits) - 1u);
+    float noise = interleavedGradientNoise(vec2(pixel) + 0.5) - 0.5; // [-0.5, 0.5)
+    return color + vec3(noise * strength / levels);
+}
 
 float mapToneCurve(float inputNits, float inputSpan)
 {
@@ -104,7 +120,9 @@ void main()
         rgb = srgbToLinear(rgb);
     }
 
-    float mask = texture(uMask, uv).r;
+    // UI detection temporarily disabled
+    float mask = 0.0;
+    // float mask = texture(uMask, uv).r;
     float ref = max(referenceNits, 1.0);
     float t = clamp(intensity, 0.0, 1.0);
 
@@ -126,11 +144,16 @@ void main()
     vec3 outRgb;
     if (outputMode < 0.5) {
         outRgb = autohdrLinearToPq(rgbNits, 10000.0);
+        outRgb = applyBitDepthDither(outRgb, gid, ditherStrength, outputBits);
+        outRgb = clamp(outRgb, 0.0, 1.0);
     } else if (outputMode < 1.5) {
         outRgb = rgbNits / 80.0;
+        outRgb = applyBitDepthDither(outRgb, gid, ditherStrength, outputBits);
     } else {
         vec3 rel = rgbNits / max(displayPeak, 1.0);
         outRgb = linearToSrgb(clamp(rel, 0.0, 1.0));
+        outRgb = applyBitDepthDither(outRgb, gid, ditherStrength, outputBits);
+        outRgb = clamp(outRgb, 0.0, 1.0);
     }
 
     imageStore(uOutput, ivec2(gid), vec4(outRgb, 1.0));
