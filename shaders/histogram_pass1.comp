@@ -1,0 +1,61 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uInput;
+layout(std430, set = 0, binding = 1) buffer GlobalHistogram {
+    uint bins[]; // 64
+};
+layout(std140, set = 0, binding = 2) uniform HistParams {
+    uvec2 extent;
+    float inputIsSrgb;
+    float referenceNits;
+};
+
+shared uint localHistogram[64];
+
+float srgbToLinear(float c)
+{
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec3 srgbToLinear(vec3 c)
+{
+    return vec3(srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b));
+}
+
+float luminance(vec3 rgb)
+{
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    const uint lid = gl_LocalInvocationIndex;
+    if (lid < 64u) {
+        localHistogram[lid] = 0u;
+    }
+    barrier();
+
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x < extent.x && gid.y < extent.y) {
+        const vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(extent);
+        vec3 rgb = texture(uInput, uv).rgb;
+        if (inputIsSrgb > 0.5) {
+            rgb = srgbToLinear(rgb);
+        }
+        // Relative SDR luminance in [0, ~1+] after ref scaling is applied later;
+        // here rgb is linear display-referred ~[0,1].
+        float y = max(luminance(rgb), 1e-6);
+        float logY = log2(y);
+        // Map log2(y) from ~[-10, 0] into 64 bins
+        float u = clamp((logY + 10.0) / 10.0, 0.0, 1.0);
+        uint bin = min(uint(u * 63.0), 63u);
+        atomicAdd(localHistogram[bin], 1u);
+    }
+    barrier();
+
+    if (lid < 64u) {
+        atomicAdd(bins[lid], localHistogram[lid]);
+    }
+}

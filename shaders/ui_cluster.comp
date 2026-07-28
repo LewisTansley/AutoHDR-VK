@@ -1,0 +1,70 @@
+#version 450
+
+// 8x8 tile UI clustering → soft R8 mask (1 = UI / lock to SDR)
+// Uniform dark tiles are NOT treated as UI (that caused blocky world corruption).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uInput;
+layout(set = 0, binding = 1, r8) writeonly uniform image2D uMask;
+layout(std140, set = 0, binding = 2) uniform UiParams {
+    uvec2 extent;
+    float inputIsSrgb;
+    float _pad;
+};
+
+shared float luma[64];
+
+float srgbToLinear(float c)
+{
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec3 srgbToLinear(vec3 c)
+{
+    return vec3(srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b));
+}
+
+void main()
+{
+    const uint lid = gl_LocalInvocationIndex;
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy) * 8;
+    const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 pix = tile + local;
+
+    float y = 0.0;
+    if (pix.x < int(extent.x) && pix.y < int(extent.y)) {
+        vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(extent);
+        vec3 rgb = texture(uInput, uv).rgb;
+        if (inputIsSrgb > 0.5) {
+            rgb = srgbToLinear(rgb);
+        }
+        y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    }
+    luma[lid] = y;
+    barrier();
+
+    float edge = 0.0;
+    if (local.x > 0) {
+        edge = max(edge, abs(luma[lid] - luma[lid - 1u]));
+    }
+    if (local.x < 7) {
+        edge = max(edge, abs(luma[lid] - luma[lid + 1u]));
+    }
+    if (local.y > 0) {
+        edge = max(edge, abs(luma[lid] - luma[lid - 8u]));
+    }
+    if (local.y < 7) {
+        edge = max(edge, abs(luma[lid] - luma[lid + 8u]));
+    }
+
+    // Sharp glyph / HUD line only — high threshold to avoid false positives
+    float sharpScore = smoothstep(0.28, 0.55, edge);
+    // Prefer near-black / near-white edges typical of UI text, not midtone foliage
+    float extreme = max(smoothstep(0.85, 0.98, luma[lid]), 1.0 - smoothstep(0.02, 0.12, luma[lid]));
+    float mask = clamp(sharpScore * extreme, 0.0, 1.0);
+    mask = smoothstep(0.70, 0.95, mask);
+
+    if (pix.x < int(extent.x) && pix.y < int(extent.y)) {
+        imageStore(uMask, pix, vec4(mask));
+    }
+}

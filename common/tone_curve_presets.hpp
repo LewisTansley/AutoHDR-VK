@@ -31,6 +31,8 @@ ToneCurvePreset presetFromString(const std::string &encoded);
 std::vector<ToneCurvePreset> builtInToneCurvePresets();
 
 std::vector<Vec2> generatePresetIntermediatePoints(ToneCurvePreset preset, const PresetCurveParams &params);
+// Morph linear (shape=0) → exponential (shape=1) intermediate points for the live LUT.
+std::vector<Vec2> generateExpansionShapePoints(float shape, const PresetCurveParams &params);
 void applyToneCurvePreset(CalibrationSettings &settings);
 
 } // namespace AutoHdr

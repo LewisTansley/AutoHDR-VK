@@ -2,16 +2,25 @@
 # Copy to ~/.config/autohdr-vk/conf.toml
 
 [global]
-# Peak and reference white in nits (match your display HDR calibration when possible)
-reference_nits = 203
-peak_nits = 1000
-black_point = 0.0
+# Primary look control (Windows AutoHDR-style). 0 = near-SDR, 1 = full peak.
+intensity = 0.5
+
+# Saturation / chroma strength (0 = luma-only + no gamut expand, 1 = full). Overlay "Color" slider.
+# Also scales gamut_expansion (see advanced overrides).
 color_intensity = 0.33
-gamut_expansion = 1.5
-highlight_softness = 0.30
-perceptual_color = true
-# linear | balanced | lifted_shadows | soft_shadows | vivid_highlights | high_contrast | exponential | custom
-tone_curve_preset = "balanced"
+
+# Shadow→highlight expansion shape (0 = linear, 1 = exponential). Overlay "Shape" slider.
+expansion_shape = 0.55
+
+# Advanced overrides (optional; kept for back-compat)
+# reference_nits = 203
+# peak_nits = 1000
+# black_point = 0.0
+# gamut_expansion = 1.0   # max expand scale when color_intensity = 1
+# highlight_softness = 0.30
+# perceptual_color = true
+# tone_curve_preset = "balanced"
+
 # auto | pq | scrgb | sdr_preview
 encoding = "auto"
 set_hdr_metadata = true
@@ -22,5 +31,4 @@ enabled = true
 # [[profile]]
 # exe = "eldenring.exe"
 # enabled = true
-# peak_nits = 800
-# tone_curve_preset = "vivid_highlights"
+# intensity = 0.7

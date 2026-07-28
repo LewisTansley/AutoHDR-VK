@@ -1,6 +1,6 @@
 # AutoHDR-VK
 
-DE-agnostic Vulkan implicit layer that applies AutoHDR’s classical SDR→HDR tone map at `vkQueuePresentKHR`. Works with native Vulkan apps and DXVK/vkd3d (Proton) under any compositor that can present HDR.
+DE-agnostic Vulkan implicit layer that applies **compute-based** AutoHDR-style SDR→HDR at `vkQueuePresentKHR` (histogram adaptation, UI mask, BT.2446 + ICtCp). Works with native Vulkan apps and DXVK/vkd3d (Proton) under any compositor that can present HDR.
 
 This does **not** replace the Plasma KWin effect. It only processes **Vulkan clients**.
 
@@ -10,6 +10,7 @@ Related: [PlasmaAutoHDR](https://github.com/LewisTansley/PlasmaAutoHDR) (KWin de
 
 - Linux, Vulkan 1.2+ ICD (Mesa / NVIDIA)
 - `glslangValidator` to build
+- Build deps: `libX11`, `wayland-client`, `libxkbcommon` (for in-game overlay hotkeys)
 - An HDR-capable presentation path for correct results (KWin HDR, gamescope HDR, Hyprland HDR, etc.)
 
 ### Compositor notes
@@ -65,6 +66,22 @@ ENABLE_AUTOHDR=1 ./my-vulkan-game
 
 Force off: `DISABLE_AUTOHDR=1`.
 
+### In-game overlay (hotkeys)
+
+| Hotkey | Action |
+|---|---|
+| **Super+H** (Shift optional) | Toggle calibrator overlay (Intensity + Shape + Color sliders) |
+
+While the overlay is open:
+
+- **Up/Down** or **Tab** — cycle Intensity / Shape (`expansion_shape`) / Color (`color_intensity`)
+- **Left/Right** — adjust ±0.05 (hold **Shift** for ±0.01)
+- **Super+H** again — close and save to `conf.toml`
+- **Esc** — close and discard changes
+- Mouse drag on tracks works on X11/XWayland when the pointer is visible
+
+Hotkeys work on **X11**, **XWayland**, and **native Wayland** (including Proton with `PROTON_ENABLE_WAYLAND=1`) via the app’s Wayland seat + xkbcommon.
+
 ## Configuration
 
 Copy the example config:
@@ -78,20 +95,21 @@ cp conf.example.toml ~/.config/autohdr-vk/conf.toml
 
 Important keys under `[global]`:
 
-- `reference_nits` / `peak_nits` — match your display calibration when possible
-- `tone_curve_preset` — `linear`, `balanced`, `lifted_shadows`, `soft_shadows`, `vivid_highlights`, `high_contrast`, `exponential`
+- **`intensity`** — primary look control (Windows AutoHDR-style): `0` ≈ SDR, `1` = full peak headroom. Linear blend toward the tonemapped result.
+- **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full chroma restore and full `gamut_expansion`). Overlay **Color** slider.
+- **`expansion_shape`** — shadow→highlight curve shape (`0` = linear / brighter mids, `1` = exponential / darker mids). Overlay **Shape** slider.
 - `encoding` — `auto` (prefer PQ on HDR10 swapchains, else SDR preview), `pq`, `scrgb`, `sdr_preview`
 - `prefer_hdr_swapchain` — try to select an HDR10 surface format/colorspace at swapchain create
-- `set_hdr_metadata` — call `vkSetHdrMetadataEXT` when available
-- `perceptual_color` / `color_intensity` / `gamut_expansion` — color path controls (see source / Plasma AutoHDR docs)
+- `set_hdr_metadata` — call `vkSetHdrMetadataEXT` when available (maxCLL/maxFALL from scene stats)
+
+Advanced overrides (optional / back-compat): `reference_nits`, `peak_nits`, `tone_curve_preset`, `gamut_expansion` (max expand scale when Color = 1), etc.
 
 Per-exe overrides:
 
 ```toml
 [[profile]]
 exe = "game.exe"
-peak_nits = 800
-tone_curve_preset = "vivid_highlights"
+intensity = 0.7
 ```
 
 Inspect resolved settings:
@@ -106,13 +124,21 @@ ENABLE_AUTOHDR=1 autohdr-vk-cli
 App / DXVK → Vulkan loader → VK_LAYER_AUTOHDR_tonemap → ICD → WSI → compositor
 ```
 
-On present, the layer copies the swapchain image, runs a fullscreen tone-map pass (black point, tone-curve LUT, vibrance, gamut expansion, highlight limit), optionally encodes PQ / scRGB, then presents.
+On present, the layer copies the swapchain image and runs a compute pipeline:
+
+1. **Histogram** — scene luminance stats (geo-mean, p10/p90, adaptive peak)
+2. **UI cluster** — 8×8 tile mask to lock flat UI/text to SDR white
+3. **Base blur** — half-res linear base layer for detail preservation
+4. **Tonemap** — BT.2446 + ICtCp spatial tonemap (base/detail split), UI mask blend, PQ/scRGB/SDR encode
+5. **Overlay** (optional) — in-swapchain intensity/color calibrator HUD
+
+Then the result is blitted back to the swapchain for present.
 
 ## Limitations
 
 - Vulkan only (OpenGL needs Zink or a separate hook)
 - No AI guidance (Plasma AutoHDR optional AI path is not ported)
-- No in-game calibration GUI yet (edit TOML / use `autohdr-vk-cli`)
+- Overlay mouse drag is X11/XWayland only; keyboard works on all backends
 - Some anti-cheat systems dislike Vulkan layers
 - Flatpak/Steam Runtime may need the layer visible inside the sandbox (`VK_LAYER_PATH` / Flatpak extension)
 
@@ -123,7 +149,7 @@ On present, the layer copies the swapchain image, runs a fullscreen tone-map pas
 | Scope | Any window | Vulkan clients only |
 | DE | Plasma 6 | Any |
 | AI guidance | Optional | Not in MVP |
-| Calibration UI | Yes | Config file |
+| Calibration UI | Qt overlay | In-swapchain Super+H overlay |
 
 ## License
 

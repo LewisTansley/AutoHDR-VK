@@ -10,11 +10,13 @@ namespace AutoHdr {
 
 struct CalibrationSettings {
     float maxNits = 1000.0f;
-    float gamutExpansion = 1.5f;
+    float gamutExpansion = 1.0f;
     float blackPoint = 0.0f;
     float colorIntensity = 0.33f;
     float referenceNits = 203.0f;
     float highlightSoftness = 0.30f;
+    float intensity = 0.5f; // primary UX: 0 = SDR-like, 1 = full peak effect
+    float expansionShape = 0.55f; // 0 = linear, 1 = exponential (darker mids)
     bool perceptualColor = true;
     Vec2 sdrMaxPoint{203.0f, 1000.0f};
     std::vector<Vec2> toneCurvePoints;
@@ -55,6 +57,28 @@ inline float clampGamutExpansion(float value)
 }
 
 inline float clampColorIntensity(float value)
+{
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    return value;
+}
+
+inline float clampIntensity(float value)
+{
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    return value;
+}
+
+inline float clampExpansionShape(float value)
 {
     if (value < 0.0f) {
         return 0.0f;

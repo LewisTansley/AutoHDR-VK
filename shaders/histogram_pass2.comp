@@ -1,0 +1,128 @@
+#version 450
+
+// Single workgroup reduce: geo-mean, p10, p90, dynamic k1, intensity peak, GPU EMA (Plan 4).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer GlobalHistogram {
+    uint bins[]; // 64
+};
+
+layout(std430, set = 0, binding = 1) buffer SceneStatsRW {
+    float geoMean;
+    float p10;
+    float p90;
+    float k1;
+    float effectivePeak;
+    float exposure;
+    float maxCLL;
+    float maxFALL;
+    uint initialized;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+layout(std140, set = 0, binding = 2) uniform AdaptParams {
+    float intensity;
+    float referenceNits;
+    float peakNits;
+    float sdrWhiteNits;
+    float adaptBrighten; // e.g. 0.25
+    float adaptDarken;   // e.g. 0.05
+    float temporalEnable;
+    float _pad;
+};
+
+shared uint binLocal[64];
+shared uint totalPixels;
+
+float ema(float prev, float target, bool goingUp)
+{
+    float a = goingUp ? adaptBrighten : adaptDarken;
+    return mix(prev, target, clamp(a, 0.0, 1.0));
+}
+
+void main()
+{
+    const uint id = gl_LocalInvocationIndex;
+    binLocal[id] = bins[id];
+    barrier();
+
+    if (id == 0u) {
+        uint sum = 0u;
+        for (uint i = 0u; i < 64u; ++i) {
+            sum += binLocal[i];
+        }
+        totalPixels = max(sum, 1u);
+
+        float logSum = 0.0;
+        uint count = 0u;
+        for (uint i = 0u; i < 64u; ++i) {
+            uint c = binLocal[i];
+            if (c == 0u) {
+                continue;
+            }
+            float u = (float(i) + 0.5) / 64.0;
+            float logY = u * 10.0 - 10.0;
+            logSum += logY * float(c);
+            count += c;
+        }
+        float meanLog = logSum / float(max(count, 1u));
+        float geo = exp2(meanLog);
+
+        uint target10 = max(totalPixels / 10u, 1u);
+        uint target90 = (totalPixels * 9u) / 10u;
+        uint cum = 0u;
+        float p10v = geo;
+        float p90v = geo;
+        bool got10 = false;
+        for (uint i = 0u; i < 64u; ++i) {
+            cum += binLocal[i];
+            float u = (float(i) + 0.5) / 64.0;
+            float y = exp2(u * 10.0 - 10.0);
+            if (!got10 && cum >= target10) {
+                p10v = y;
+                got10 = true;
+            }
+            if (cum >= target90) {
+                p90v = y;
+                break;
+            }
+        }
+
+        float k1Raw = mix(0.70, 0.90, smoothstep(0.08, 0.55, p90v));
+        // Full panel peak for the HDR look; intensity is applied only as post-map mix in tonemap.
+        float maxEffectPeak = max(peakNits, max(referenceNits, sdrWhiteNits));
+        // Inverse ABL: pull peak down when the frame is mid/bright on average or has large highlight mass.
+        // Dark rooms keep more headroom for sparse speculars only.
+        float brightMass = smoothstep(0.06, 0.28, geo);
+        float highlightFlood = smoothstep(0.15, 0.42, p90v);
+        float abl = mix(1.0, 0.22, max(brightMass, highlightFlood * 0.95));
+        // Extra restraint when geo-mean is elevated (lobby/UI-heavy / bright scenes).
+        abl *= mix(1.0, 0.45, smoothstep(0.08, 0.30, geo));
+        // Title/flood frames: hug reference white so max intensity cannot wash the frame.
+        abl *= mix(1.0, 0.40, highlightFlood * brightMass);
+        float peakRaw = max(maxEffectPeak * abl, max(referenceNits, sdrWhiteNits));
+        // Keep exposure at 1; BT.2446 uses k1 + effectivePeak only (no overall gain lift).
+        float exposureRaw = 1.0;
+
+        float geoOut = geo;
+        float k1Out = k1Raw;
+        float peakOut = peakRaw;
+        if (temporalEnable > 0.5 && initialized != 0u) {
+            geoOut = ema(geoMean, geo, geo > geoMean);
+            k1Out = ema(k1, k1Raw, k1Raw > k1);
+            peakOut = ema(effectivePeak, peakRaw, peakRaw > effectivePeak);
+        }
+
+        geoMean = geoOut;
+        p10 = p10v;
+        p90 = p90v;
+        k1 = k1Out;
+        effectivePeak = peakOut;
+        exposure = exposureRaw;
+        maxFALL = geoOut * referenceNits;
+        maxCLL = p90v * peakOut;
+        initialized = 1u;
+    }
+}

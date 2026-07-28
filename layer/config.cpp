@@ -44,6 +44,9 @@ OutputEncoding encodingFromString(const std::string &value)
 
 void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &settings)
 {
+    if (auto v = table["intensity"].value<double>()) {
+        settings.intensity = AutoHdr::clampIntensity(static_cast<float>(*v));
+    }
     if (auto v = table["reference_nits"].value<double>()) {
         settings.referenceNits = AutoHdr::clampReferenceNits(static_cast<float>(*v));
     }
@@ -55,6 +58,9 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     }
     if (auto v = table["color_intensity"].value<double>()) {
         settings.colorIntensity = AutoHdr::clampColorIntensity(static_cast<float>(*v));
+    }
+    if (auto v = table["expansion_shape"].value<double>()) {
+        settings.expansionShape = AutoHdr::clampExpansionShape(static_cast<float>(*v));
     }
     if (auto v = table["gamut_expansion"].value<double>()) {
         settings.gamutExpansion = AutoHdr::clampGamutExpansion(static_cast<float>(*v));
@@ -80,10 +86,12 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
 
 void finalizeSettings(AutoHdr::CalibrationSettings &settings)
 {
+    settings.intensity = AutoHdr::clampIntensity(settings.intensity);
     settings.referenceNits = AutoHdr::clampReferenceNits(settings.referenceNits);
     settings.maxNits = std::max(settings.maxNits, settings.referenceNits);
     settings.blackPoint = AutoHdr::clampBlackPoint(settings.blackPoint);
     settings.colorIntensity = AutoHdr::clampColorIntensity(settings.colorIntensity);
+    settings.expansionShape = AutoHdr::clampExpansionShape(settings.expansionShape);
     settings.gamutExpansion = AutoHdr::clampGamutExpansion(settings.gamutExpansion);
     settings.highlightSoftness = AutoHdr::clampHighlightSoftness(settings.highlightSoftness);
 
@@ -293,6 +301,95 @@ bool wantPreferHdrSwapchain()
     std::lock_guard lock(g_configMutex);
     ensureLoaded();
     return g_config.preferHdrSwapchain;
+}
+
+bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape)
+{
+    std::lock_guard lock(g_configMutex);
+    ensureLoaded();
+
+    intensity = AutoHdr::clampIntensity(intensity);
+    colorIntensity = AutoHdr::clampColorIntensity(colorIntensity);
+    expansionShape = AutoHdr::clampExpansionShape(expansionShape);
+
+    // Update in-memory first so subsequent activeSettings() sees the new values.
+    if (Profile *profile = const_cast<Profile *>(matchingProfileLocked())) {
+        profile->settings.intensity = intensity;
+        profile->settings.colorIntensity = colorIntensity;
+        profile->settings.expansionShape = expansionShape;
+    } else {
+        g_config.global.intensity = intensity;
+        g_config.global.colorIntensity = colorIntensity;
+        g_config.global.expansionShape = expansionShape;
+    }
+
+    if (g_config.configPath.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path path = g_config.configPath;
+    try {
+        toml::table root;
+        if (std::filesystem::exists(path)) {
+            root = toml::parse_file(path.string());
+        }
+
+        const Profile *matched = matchingProfileLocked();
+        if (matched) {
+            auto *arr = root["profile"].as_array();
+            if (!arr) {
+                root.insert_or_assign("profile", toml::array{});
+                arr = root["profile"].as_array();
+            }
+            bool updated = false;
+            const std::string want = toLower(matched->exe);
+            for (auto &node : *arr) {
+                auto *table = node.as_table();
+                if (!table) {
+                    continue;
+                }
+                auto exe = (*table)["exe"].value<std::string>();
+                if (!exe || toLower(*exe) != want) {
+                    continue;
+                }
+                table->insert_or_assign("intensity", static_cast<double>(intensity));
+                table->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
+                table->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+                updated = true;
+                break;
+            }
+            if (!updated) {
+                toml::table table;
+                table.insert("exe", matched->exe);
+                table.insert("intensity", static_cast<double>(intensity));
+                table.insert("color_intensity", static_cast<double>(colorIntensity));
+                table.insert("expansion_shape", static_cast<double>(expansionShape));
+                arr->push_back(std::move(table));
+            }
+        } else {
+            auto *global = root["global"].as_table();
+            if (!global) {
+                root.insert_or_assign("global", toml::table{});
+                global = root["global"].as_table();
+            }
+            global->insert_or_assign("intensity", static_cast<double>(intensity));
+            global->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
+            global->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+        }
+
+        const std::filesystem::path tmp = path.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                return false;
+            }
+            out << root;
+        }
+        std::filesystem::rename(tmp, path);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace AutoHdrVk

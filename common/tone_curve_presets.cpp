@@ -11,7 +11,6 @@ namespace AutoHdr {
 
 namespace {
 
-constexpr float kSampleFractions[] = {0.25f, 0.5f, 0.75f};
 constexpr float kExponentialRate = 2.4f;
 
 struct BuiltInCalibratedCurve {
@@ -144,13 +143,22 @@ std::vector<Vec2> generatePresetIntermediatePoints(ToneCurvePreset preset, const
         return {};
     }
 
+    return generateExpansionShapePoints(1.0f, params);
+}
+
+std::vector<Vec2> generateExpansionShapePoints(float shape, const PresetCurveParams &params)
+{
     const float ref = std::max(params.referenceNits, 1e-3f);
     const float peak = std::max(params.peakNits, ref);
+    const float s = std::clamp(shape, 0.0f, 1.0f);
 
+    // Dense enough intermediates for a smooth LUT morph between linear and exponential.
+    constexpr float kFractions[] = {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f};
     std::vector<Vec2> points;
-    points.reserve(3);
-    for (float t : kSampleFractions) {
-        points.push_back({t * ref, exponentialMapping(t) * peak});
+    points.reserve(sizeof(kFractions) / sizeof(kFractions[0]));
+    for (float t : kFractions) {
+        const float outNorm = t + (exponentialMapping(t) - t) * s;
+        points.push_back({t * ref, outNorm * peak});
     }
 
     ToneCurveEndpoints endpoints;

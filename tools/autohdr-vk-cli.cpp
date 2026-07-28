@@ -29,17 +29,20 @@ int main(int argc, char **argv)
     std::cout << "enabled:        " << (AutoHdrVk::isEffectActiveForCurrentProcess() ? "yes" : "no") << '\n';
 
     const auto settings = AutoHdrVk::activeSettings();
+    std::cout << "intensity:      " << settings.intensity << '\n';
     std::cout << "reference_nits: " << settings.referenceNits << '\n';
     std::cout << "peak_nits:      " << settings.maxNits << '\n';
     std::cout << "black_point:    " << settings.blackPoint << '\n';
     std::cout << "color_intensity:" << settings.colorIntensity << '\n';
+    std::cout << "expansion_shape:" << settings.expansionShape << '\n';
     std::cout << "gamut_expansion:" << settings.gamutExpansion << '\n';
     std::cout << "tone_curve:     " << AutoHdr::presetToString(settings.toneCurvePreset) << '\n';
     std::cout << "curve_points:   " << AutoHdr::formatToneCurvePoints(settings.toneCurvePoints) << '\n';
     std::cout << "sdr_max_point:  " << AutoHdr::formatSdrMaxPoint(settings.sdrMaxPoint) << '\n';
     std::cout << "profiles:       " << cfg.profiles.size() << '\n';
     for (const auto &p : cfg.profiles) {
-        std::cout << "  - exe=" << p.exe << " enabled=" << (p.enabled ? "yes" : "no") << '\n';
+        std::cout << "  - exe=" << p.exe << " enabled=" << (p.enabled ? "yes" : "no")
+                  << " intensity=" << p.settings.intensity << '\n';
     }
     return 0;
 }

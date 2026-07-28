@@ -1,5 +1,7 @@
 #include "layer_common.hpp"
 #include "config.hpp"
+#include "input.hpp"
+#include "runtime_ui.hpp"
 
 #ifndef VK_LAYER_EXPORT
 #if defined(__GNUC__) && __GNUC__ >= 4
@@ -50,6 +52,74 @@ OutputEncoding resolveEncoding(VkColorSpaceKHR cs)
     return OutputEncoding::SdrPreview;
 }
 
+float encodingToOutputMode(OutputEncoding encoding)
+{
+    switch (encoding) {
+    case OutputEncoding::LinearScRgb:
+        return 1.0f;
+    case OutputEncoding::SdrPreview:
+        return 2.0f;
+    default:
+        return 0.0f;
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateWaylandSurfaceKHR(VkInstance instance,
+                                                       const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
+                                                       const VkAllocationCallbacks *pAllocator,
+                                                       VkSurfaceKHR *pSurface)
+{
+    InstanceData *data = getInstanceData(instance);
+    if (!data || !data->dispatch.CreateWaylandSurfaceKHR) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    const VkResult result = data->dispatch.CreateWaylandSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+    if (result == VK_SUCCESS && pCreateInfo && pSurface) {
+        registerWaylandSurface(reinterpret_cast<void *>(*pSurface), pCreateInfo->display);
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateXlibSurfaceKHR(VkInstance instance, const VkXlibSurfaceCreateInfoKHR *pCreateInfo,
+                                                    const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface)
+{
+    InstanceData *data = getInstanceData(instance);
+    if (!data || !data->dispatch.CreateXlibSurfaceKHR) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    const VkResult result = data->dispatch.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+    if (result == VK_SUCCESS && pCreateInfo && pSurface) {
+        registerX11Window(reinterpret_cast<void *>(*pSurface), static_cast<unsigned long>(pCreateInfo->window));
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateXcbSurfaceKHR(VkInstance instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
+                                                   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface)
+{
+    InstanceData *data = getInstanceData(instance);
+    if (!data || !data->dispatch.CreateXcbSurfaceKHR) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    const VkResult result = data->dispatch.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+    if (result == VK_SUCCESS && pCreateInfo && pSurface) {
+        // XCB window ids are interchangeable with Xlib Window on the same server.
+        registerX11Window(reinterpret_cast<void *>(*pSurface), static_cast<unsigned long>(pCreateInfo->window));
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                                             const VkAllocationCallbacks *pAllocator)
+{
+    unregisterWaylandSurface(reinterpret_cast<void *>(surface));
+    unregisterX11Window(reinterpret_cast<void *>(surface));
+    InstanceData *data = getInstanceData(instance);
+    if (data && data->dispatch.DestroySurfaceKHR) {
+        data->dispatch.DestroySurfaceKHR(instance, surface, pAllocator);
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                                               const VkAllocationCallbacks *pAllocator, VkInstance *pInstance)
 {
@@ -94,6 +164,13 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *pCreat
         gipa, *pInstance, "vkGetPhysicalDeviceSurfaceFormatsKHR");
     data->dispatch.EnumerateDeviceExtensionProperties = getProc<PFN_vkEnumerateDeviceExtensionProperties>(
         gipa, *pInstance, "vkEnumerateDeviceExtensionProperties");
+    data->dispatch.DestroySurfaceKHR = getProc<PFN_vkDestroySurfaceKHR>(gipa, *pInstance, "vkDestroySurfaceKHR");
+    data->dispatch.CreateWaylandSurfaceKHR =
+        getProc<PFN_vkCreateWaylandSurfaceKHR>(gipa, *pInstance, "vkCreateWaylandSurfaceKHR");
+    data->dispatch.CreateXlibSurfaceKHR =
+        getProc<PFN_vkCreateXlibSurfaceKHR>(gipa, *pInstance, "vkCreateXlibSurfaceKHR");
+    data->dispatch.CreateXcbSurfaceKHR =
+        getProc<PFN_vkCreateXcbSurfaceKHR>(gipa, *pInstance, "vkCreateXcbSurfaceKHR");
 
     {
         std::lock_guard lock(globalMutex());
@@ -198,17 +275,13 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     LOAD(DestroyImageView);
     LOAD(CreateSampler);
     LOAD(DestroySampler);
-    LOAD(CreateRenderPass);
-    LOAD(DestroyRenderPass);
-    LOAD(CreateFramebuffer);
-    LOAD(DestroyFramebuffer);
     LOAD(CreateDescriptorSetLayout);
     LOAD(DestroyDescriptorSetLayout);
     LOAD(CreatePipelineLayout);
     LOAD(DestroyPipelineLayout);
     LOAD(CreateShaderModule);
     LOAD(DestroyShaderModule);
-    LOAD(CreateGraphicsPipelines);
+    LOAD(CreateComputePipelines);
     LOAD(DestroyPipeline);
     LOAD(CreateDescriptorPool);
     LOAD(DestroyDescriptorPool);
@@ -227,12 +300,12 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     LOAD(BeginCommandBuffer);
     LOAD(EndCommandBuffer);
     LOAD(CmdPipelineBarrier);
-    LOAD(CmdBeginRenderPass);
-    LOAD(CmdEndRenderPass);
     LOAD(CmdBindPipeline);
     LOAD(CmdBindDescriptorSets);
-    LOAD(CmdDraw);
+    LOAD(CmdDispatch);
     LOAD(CmdCopyImage);
+    LOAD(CmdBlitImage);
+    LOAD(CmdFillBuffer);
     LOAD(QueueSubmit);
     LOAD(CreateFence);
     LOAD(DestroyFence);
@@ -245,15 +318,19 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     dd.SetHdrMetadataEXT = getProc<PFN_vkSetHdrMetadataEXT>(gdpa, *pDevice, "vkSetHdrMetadataEXT");
     dev->hdrMetadataExt = dd.SetHdrMetadataEXT != nullptr;
 
-    // Pick first graphics queue family.
+    // Prefer a queue family with graphics+compute (apps almost always create one).
     uint32_t qCount = 0;
     instanceData->dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, nullptr);
     std::vector<VkQueueFamilyProperties> qprops(qCount);
     instanceData->dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qCount, qprops.data());
     for (uint32_t i = 0; i < qCount; ++i) {
-        if (qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+        if ((qprops[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
             dev->graphicsQueueFamily = i;
             break;
+        }
+        if (qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            dev->graphicsQueueFamily = i;
         }
     }
     if (pCreateInfo->queueCreateInfoCount > 0) {
@@ -305,11 +382,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
     VkSwapchainCreateInfoKHR info = *pCreateInfo;
     info.imageUsage = static_cast<VkImageUsageFlags>(info.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                                                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                                                     | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                                                      | VK_IMAGE_USAGE_SAMPLED_BIT);
 
     // Prefer HDR10 colorspace when available and configured.
-    if (wantPreferHdrSwapchain() && isEffectActiveForCurrentProcess() && pCreateInfo->surface
+    if (wantPreferHdrSwapchain() && pCreateInfo->surface
         && dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR) {
         uint32_t formatCount = 0;
         dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR(dev->physicalDevice, pCreateInfo->surface,
@@ -338,10 +414,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
         return result;
     }
 
-    if (!isEffectActiveForCurrentProcess()) {
-        return result;
-    }
-
+    // Always create GPU resources so Super+H overlay works mid-session.
     SwapchainData sc{};
     sc.swapchain = *pSwapchain;
     sc.device = device;
@@ -417,12 +490,37 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         }
     }
 
-    if (!dev || !isEffectActiveForCurrentProcess() || !pPresentInfo || pPresentInfo->swapchainCount == 0) {
+    if (!dev || !pPresentInfo || pPresentInfo->swapchainCount == 0) {
         if (dev && dev->dispatch.QueuePresentKHR) {
             return dev->dispatch.QueuePresentKHR(queue, pPresentInfo);
         }
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+
+    // Resolve extent/encoding for hotkey UI from first known swapchain.
+    uint32_t uiW = 0;
+    uint32_t uiH = 0;
+    float uiOutputMode = 0.0f;
+    {
+        std::lock_guard lock(dev->mutex);
+        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
+            auto it = dev->swapchains.find(reinterpret_cast<uint64_t>(pPresentInfo->pSwapchains[i]));
+            if (it != dev->swapchains.end() && it->second.active) {
+                uiW = it->second.extent.width;
+                uiH = it->second.extent.height;
+                uiOutputMode = encodingToOutputMode(it->second.encoding);
+                break;
+            }
+        }
+    }
+    updateRuntimeUi(uiW, uiH, uiOutputMode);
+
+    if (!shouldProcessPresent()) {
+        return dev->dispatch.QueuePresentKHR(queue, pPresentInfo);
+    }
+
+    const bool effectOn = runtimeEffectOn();
+    const bool drawOverlay = overlayVisible();
 
     VkPresentInfoKHR present = *pPresentInfo;
     std::vector<VkSemaphore> waitSemaphores;
@@ -448,7 +546,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
 
         VkSemaphore signal = VK_NULL_HANDLE;
         const bool ok = processPresent(dev, it->second, imageIndex, queue, pPresentInfo->waitSemaphoreCount,
-                                       pPresentInfo->pWaitSemaphores, signal);
+                                       pPresentInfo->pWaitSemaphores, signal, effectOn, drawOverlay);
         if (!ok) {
             swapchains.push_back(scHandle);
             imageIndices.push_back(imageIndex);
@@ -505,6 +603,18 @@ PFN_vkVoidFunction getInstanceProcAddrImpl(VkInstance instance, const char *pNam
     }
     if (name == "vkCreateDevice") {
         return reinterpret_cast<PFN_vkVoidFunction>(CreateDevice);
+    }
+    if (name == "vkCreateWaylandSurfaceKHR") {
+        return reinterpret_cast<PFN_vkVoidFunction>(CreateWaylandSurfaceKHR);
+    }
+    if (name == "vkCreateXlibSurfaceKHR") {
+        return reinterpret_cast<PFN_vkVoidFunction>(CreateXlibSurfaceKHR);
+    }
+    if (name == "vkCreateXcbSurfaceKHR") {
+        return reinterpret_cast<PFN_vkVoidFunction>(CreateXcbSurfaceKHR);
+    }
+    if (name == "vkDestroySurfaceKHR") {
+        return reinterpret_cast<PFN_vkVoidFunction>(DestroySurfaceKHR);
     }
     if (name == "vkGetInstanceProcAddr") {
         return reinterpret_cast<PFN_vkVoidFunction>(getInstanceProcAddrImpl);

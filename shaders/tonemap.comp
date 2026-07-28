@@ -1,0 +1,137 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Legacy tone-curve + perceptual color path on the compute scaffold.
+// Intensity is a linear post-map blend (0 = SDR, 1 = full legacy HDR look).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uInput;
+layout(std140, set = 0, binding = 1) uniform ToneLut {
+    vec4 toneCurveLutPacked[256]; // 1024 floats
+};
+layout(set = 0, binding = 2) uniform sampler2D uMask;
+layout(std140, set = 0, binding = 3) uniform ToneParams {
+    float blackPoint;
+    float colorIntensity;
+    float gamutExpansion;
+    float referenceNits;
+    float peakNits;
+    float toneCurveInputSpan;
+    float highlightSoftness;
+    float perceptualColorEnabled;
+    float outputMode; // 0=pq, 1=scrgb, 2=sdr preview
+    float inputIsSrgb;
+    float intensity;
+    float _pad0;
+    vec4 pqBoostParams;
+    uvec2 extent;
+    uvec2 _padExtent;
+};
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D uOutput;
+layout(std430, set = 0, binding = 5) readonly buffer SceneStatsBlock {
+    float geoMean;
+    float p10;
+    float p90;
+    float k1;
+    float effectivePeak;
+    float exposure;
+    float maxCLL;
+    float maxFALL;
+    uint initialized;
+    uint _pad0s;
+    uint _pad1s;
+    uint _pad2s;
+} sceneStats;
+
+#include "tonemap_color.glsl"
+
+float mapToneCurve(float inputNits, float inputSpan)
+{
+    float span = max(inputSpan, 1e-3);
+    float u = clamp(inputNits / span, 0.0, 1.0);
+    float idx = u * 1023.0;
+    int i0 = int(floor(idx));
+    int i1 = min(i0 + 1, 1023);
+    float t = fract(idx);
+    float y0 = toneCurveLutPacked[i0 / 4][i0 % 4];
+    float y1 = toneCurveLutPacked[i1 / 4][i1 % 4];
+    return mix(y0, y1, t);
+}
+
+vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan)
+{
+    rgbNits = reconstructHighlights(rgbNits, ref);
+
+    float rawLumaNits = max(luminanceYNits(rgbNits), 1e-6);
+    float curveInputNits = applyUserBlackPoint(rawLumaNits / ref, blackPoint) * ref;
+    float outputNits = mapToneCurve(curveInputNits, curveSpan);
+
+    // Color slider gates gamut expand: 0 = none, 1 = full gamut_expansion max.
+    float effectiveGamut = max(gamutExpansion, 0.0) * clamp(colorIntensity, 0.0, 1.0);
+
+    if (perceptualColorEnabled > 0.5) {
+        rgbNits = applyPerceptualLuminanceMap(rgbNits, rawLumaNits, outputNits, colorIntensity, pqBoostParams);
+        if (effectiveGamut > 0.0) {
+            rgbNits = expandGamutSmart(rgbNits / ref, effectiveGamut) * ref;
+        }
+        vec3 xyz = autohdrRec709ToXYZ(rgbNits);
+        float outY = max(xyz.y, 1e-6);
+        float limitedY = applyHighlightPeakLimit(outY, displayPeak, highlightSoftness);
+        rgbNits = autohdrXyzToRec709(xyz * (limitedY / outY));
+    } else {
+        float scale = outputNits / max(rawLumaNits, 1e-6);
+        rgbNits *= scale;
+        if (effectiveGamut > 0.0) {
+            rgbNits = expandGamutSmart(rgbNits / ref, effectiveGamut) * ref;
+        }
+        float outLuma = dot(rgbNits, AUTOHDR_LUMA);
+        float limitedLuma = applyHighlightPeakLimit(outLuma, displayPeak, highlightSoftness);
+        rgbNits *= limitedLuma / max(outLuma, 1e-6);
+    }
+    return max(rgbNits, vec3(0.0));
+}
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= extent.x || gid.y >= extent.y) {
+        return;
+    }
+
+    const vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(extent);
+    vec3 rgb = texture(uInput, uv).rgb;
+    if (inputIsSrgb > 0.5) {
+        rgb = srgbToLinear(rgb);
+    }
+
+    float mask = texture(uMask, uv).r;
+    float ref = max(referenceNits, 1.0);
+    float t = clamp(intensity, 0.0, 1.0);
+
+    // Peak from hist ABL when available — intensity does NOT shrink the curve target
+    // (avoids mid-slider dead zone). Strength is the post-map mix only.
+    float displayPeak = max(peakNits, ref);
+    if (sceneStats.initialized != 0u) {
+        displayPeak = clamp(sceneStats.effectivePeak, ref, max(peakNits, ref));
+    }
+
+    float curveSpan = toneCurveInputSpan > 1.0 ? toneCurveInputSpan : ref;
+    vec3 sdrNits = rgb * ref;
+    vec3 legacyMapped = toneMapPipeline(sdrNits, ref, displayPeak, curveSpan);
+    vec3 mapped = mix(sdrNits, legacyMapped, t);
+
+    // UI lock: keep detected HUD / text at SDR reference white.
+    vec3 rgbNits = mix(mapped, sdrNits, clamp(mask, 0.0, 1.0));
+
+    vec3 outRgb;
+    if (outputMode < 0.5) {
+        outRgb = autohdrLinearToPq(rgbNits, 10000.0);
+    } else if (outputMode < 1.5) {
+        outRgb = rgbNits / 80.0;
+    } else {
+        vec3 rel = rgbNits / max(displayPeak, 1.0);
+        outRgb = linearToSrgb(clamp(rel, 0.0, 1.0));
+    }
+
+    imageStore(uOutput, ivec2(gid), vec4(outRgb, 1.0));
+}

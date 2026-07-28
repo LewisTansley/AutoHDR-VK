@@ -29,24 +29,40 @@ function(compile_shader NAME VAR_NAME)
             -o ${OUT}
             -x
             --vn ${VAR_NAME}
-        DEPENDS ${SRC} ${SHADER_DIR}/tonemap_color.glsl
+        DEPENDS ${SRC}
+            ${SHADER_DIR}/tonemap_color.glsl
+            ${SHADER_DIR}/ictcp.glsl
+            ${SHADER_DIR}/bt2446.glsl
         COMMENT "Compiling ${NAME}"
         VERBATIM
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
 endfunction()
 
-compile_shader(tonemap.vert tonemap_vert_spv)
-compile_shader(tonemap.frag tonemap_frag_spv)
+compile_shader(tonemap.comp tonemap_comp_spv)
+compile_shader(histogram_pass1.comp histogram_pass1_comp_spv)
+compile_shader(histogram_pass2.comp histogram_pass2_comp_spv)
+compile_shader(ui_cluster.comp ui_cluster_comp_spv)
+compile_shader(base_blur.comp base_blur_comp_spv)
+compile_shader(overlay.comp overlay_comp_spv)
 
 add_library(VkLayer_AUTOHDR_tonemap SHARED
     layer/entry.cpp
     layer/pipeline.cpp
     layer/config.cpp
+    layer/input.cpp
+    layer/input_x11.cpp
+    layer/input_wayland.cpp
+    layer/runtime_ui.cpp
     common/tone_curve.cpp
     common/tone_curve_presets.cpp
     ${SHADER_HEADERS}
 )
+
+find_package(X11 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 
 target_include_directories(VkLayer_AUTOHDR_tonemap
     PRIVATE
@@ -54,9 +70,16 @@ target_include_directories(VkLayer_AUTOHDR_tonemap
         ${CMAKE_CURRENT_SOURCE_DIR}/common
         ${SHADER_GEN_DIR}
         ${Vulkan_INCLUDE_DIRS}
+        ${WAYLAND_CLIENT_INCLUDE_DIRS}
+        ${XKBCOMMON_INCLUDE_DIRS}
 )
 
-target_link_libraries(VkLayer_AUTOHDR_tonemap PRIVATE Vulkan::Vulkan)
+target_link_libraries(VkLayer_AUTOHDR_tonemap PRIVATE
+    Vulkan::Vulkan
+    X11::X11
+    ${WAYLAND_CLIENT_LIBRARIES}
+    ${XKBCOMMON_LIBRARIES}
+)
 
 if(UNIX AND NOT APPLE)
     target_link_options(VkLayer_AUTOHDR_tonemap PRIVATE
