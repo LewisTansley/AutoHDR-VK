@@ -43,7 +43,8 @@ AutoHdr::CalibrationSettings activeSettings();
 OutputEncoding activeEncoding();
 bool wantHdrMetadata();
 bool wantPreferHdrSwapchain();
-bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape);
+bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float blackFloor,
+                         float highlightStretch);
 
 std::string currentExecutableName();
 

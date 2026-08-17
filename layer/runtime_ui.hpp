@@ -9,7 +9,9 @@ namespace AutoHdrVk {
 enum class FocusedSlider : int {
     Intensity = 0,
     ExpansionShape = 1,
-    ColorIntensity = 2,
+    HighlightStretch = 2,
+    BlackFloor = 3,
+    ColorIntensity = 4,
 };
 
 struct OverlayDrawState {
@@ -17,6 +19,8 @@ struct OverlayDrawState {
     float intensity = 0.5f;
     float colorIntensity = 0.33f;
     float expansionShape = 0.55f;
+    float blackFloor = 0.0f;
+    float highlightStretch = 0.45f;
     int focused = 0;
     float panelNits = 203.0f;
     float outputMode = 0.0f; // 0=pq, 1=scrgb, 2=sdr

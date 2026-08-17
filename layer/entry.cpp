@@ -268,6 +268,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     LOAD(CreateImage);
     LOAD(DestroyImage);
     LOAD(GetImageMemoryRequirements);
+    LOAD(GetImageSubresourceLayout);
     LOAD(AllocateMemory);
     LOAD(FreeMemory);
     LOAD(BindImageMemory);
@@ -300,6 +301,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     LOAD(BeginCommandBuffer);
     LOAD(EndCommandBuffer);
     LOAD(CmdPipelineBarrier);
+    LOAD(CmdCopyBufferToImage);
     LOAD(CmdBindPipeline);
     LOAD(CmdBindDescriptorSets);
     LOAD(CmdDispatch);
@@ -382,7 +384,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
     VkSwapchainCreateInfoKHR info = *pCreateInfo;
     info.imageUsage = static_cast<VkImageUsageFlags>(info.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                                                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                                                     | VK_IMAGE_USAGE_SAMPLED_BIT);
+                                                     | VK_IMAGE_USAGE_SAMPLED_BIT
+                                                     | VK_IMAGE_USAGE_STORAGE_BIT);
 
     // Prefer HDR10 colorspace when available and configured.
     if (wantPreferHdrSwapchain() && pCreateInfo->surface

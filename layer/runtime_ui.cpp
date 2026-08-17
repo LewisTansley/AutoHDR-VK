@@ -19,6 +19,7 @@ struct RuntimeState {
     bool seeded = false;
     bool effectOn = true;
     bool overlayVisible = false;
+    bool virtualPointerArmed = false;
     bool hasDraft = false;
     AutoHdr::CalibrationSettings baseline{};
     AutoHdr::CalibrationSettings draft{};
@@ -66,10 +67,21 @@ void openOverlayLocked()
     g_state.draft = g_state.baseline;
     g_state.hasDraft = true;
     g_state.overlayVisible = true;
+    g_state.virtualPointerArmed = false;
     g_state.focused = FocusedSlider::Intensity;
     g_state.dragging = false;
-    logf("overlay open intensity=%.2f color=%.2f shape=%.2f", g_state.draft.intensity,
-         g_state.draft.colorIntensity, g_state.draft.expansionShape);
+    logf("overlay open intensity=%.2f color=%.2f shape=%.2f floor=%.2f stretch=%.2f", g_state.draft.intensity,
+         g_state.draft.colorIntensity, g_state.draft.expansionShape, g_state.draft.blackFloor,
+         g_state.draft.highlightStretch);
+}
+
+void disarmVirtualPointerLocked()
+{
+    if (!g_state.virtualPointerArmed) {
+        return;
+    }
+    setOverlayVirtualPointer(false, 0.0f, 0.0f);
+    g_state.virtualPointerArmed = false;
 }
 
 void closeOverlayConfirmLocked()
@@ -80,13 +92,17 @@ void closeOverlayConfirmLocked()
     const float intensity = AutoHdr::clampIntensity(g_state.draft.intensity);
     const float color = AutoHdr::clampColorIntensity(g_state.draft.colorIntensity);
     const float shape = AutoHdr::clampExpansionShape(g_state.draft.expansionShape);
-    saveOverlaySettings(intensity, color, shape);
+    const float floor = AutoHdr::clampBlackFloor(g_state.draft.blackFloor);
+    const float stretch = AutoHdr::clampHighlightStretch(g_state.draft.highlightStretch);
+    saveOverlaySettings(intensity, color, shape, floor, stretch);
     g_state.baseline = activeSettings();
     g_state.draft = g_state.baseline;
     g_state.hasDraft = false;
     g_state.overlayVisible = false;
     g_state.dragging = false;
-    logf("overlay saved intensity=%.2f color=%.2f shape=%.2f", intensity, color, shape);
+    disarmVirtualPointerLocked();
+    logf("overlay saved intensity=%.2f color=%.2f shape=%.2f floor=%.2f stretch=%.2f", intensity, color, shape, floor,
+         stretch);
 }
 
 void closeOverlayCancelLocked()
@@ -98,6 +114,7 @@ void closeOverlayCancelLocked()
     g_state.hasDraft = false;
     g_state.overlayVisible = false;
     g_state.dragging = false;
+    disarmVirtualPointerLocked();
     logf("overlay cancelled");
 }
 
@@ -107,10 +124,22 @@ void adjustFocusedLocked(float delta)
         g_state.draft.intensity = AutoHdr::clampIntensity(g_state.draft.intensity + delta);
     } else if (g_state.focused == FocusedSlider::ColorIntensity) {
         g_state.draft.colorIntensity = AutoHdr::clampColorIntensity(g_state.draft.colorIntensity + delta);
+    } else if (g_state.focused == FocusedSlider::BlackFloor) {
+        g_state.draft.blackFloor = AutoHdr::clampBlackFloor(g_state.draft.blackFloor + delta);
+    } else if (g_state.focused == FocusedSlider::HighlightStretch) {
+        g_state.draft.highlightStretch = AutoHdr::clampHighlightStretch(g_state.draft.highlightStretch + delta);
     } else {
         g_state.draft.expansionShape = AutoHdr::clampExpansionShape(g_state.draft.expansionShape + delta);
     }
     g_state.hasDraft = true;
+}
+
+float adjustStepForFocused(FocusedSlider focused, bool shift)
+{
+    if (focused == FocusedSlider::BlackFloor) {
+        return shift ? 0.001f : 0.005f;
+    }
+    return shift ? 0.01f : 0.05f;
 }
 
 FocusedSlider nextSlider(FocusedSlider cur)
@@ -119,6 +148,10 @@ FocusedSlider nextSlider(FocusedSlider cur)
     case FocusedSlider::Intensity:
         return FocusedSlider::ExpansionShape;
     case FocusedSlider::ExpansionShape:
+        return FocusedSlider::HighlightStretch;
+    case FocusedSlider::HighlightStretch:
+        return FocusedSlider::BlackFloor;
+    case FocusedSlider::BlackFloor:
         return FocusedSlider::ColorIntensity;
     case FocusedSlider::ColorIntensity:
         return FocusedSlider::Intensity;
@@ -133,8 +166,12 @@ FocusedSlider prevSlider(FocusedSlider cur)
         return FocusedSlider::ColorIntensity;
     case FocusedSlider::ExpansionShape:
         return FocusedSlider::Intensity;
-    case FocusedSlider::ColorIntensity:
+    case FocusedSlider::HighlightStretch:
         return FocusedSlider::ExpansionShape;
+    case FocusedSlider::BlackFloor:
+        return FocusedSlider::HighlightStretch;
+    case FocusedSlider::ColorIntensity:
+        return FocusedSlider::BlackFloor;
     }
     return FocusedSlider::Intensity;
 }
@@ -143,14 +180,14 @@ FocusedSlider prevSlider(FocusedSlider cur)
 struct PanelGeom {
     float x0, y0, x1, y1;
     float trackX0, trackX1;
-    float intensityY, shapeY, colorY;
+    float intensityY, shapeY, stretchY, floorY, colorY;
     float trackH;
 };
 
 PanelGeom makePanel(uint32_t w, uint32_t h)
 {
     const float pw = std::min(520.0f, static_cast<float>(w) * 0.55f);
-    const float ph = 148.0f;
+    const float ph = 216.0f;
     const float x0 = (static_cast<float>(w) - pw) * 0.5f;
     const float y0 = static_cast<float>(h) - ph - 48.0f;
     PanelGeom g{};
@@ -159,13 +196,27 @@ PanelGeom makePanel(uint32_t w, uint32_t h)
     g.x1 = x0 + pw;
     g.y1 = y0 + ph;
     g.trackX0 = x0 + 140.0f;
-    g.trackX1 = x0 + pw - 70.0f;
-    // Row order must match overlay.comp: Intensity, Shape, Color.
+    g.trackX1 = x0 + pw - 16.0f;
+    // Row order must match overlay.comp: Intensity, Shape, Stretch, Floor, Color.
     g.intensityY = y0 + 34.0f;
     g.shapeY = y0 + 68.0f;
-    g.colorY = y0 + 102.0f;
+    g.stretchY = y0 + 102.0f;
+    g.floorY = y0 + 136.0f;
+    g.colorY = y0 + 170.0f;
     g.trackH = 14.0f;
     return g;
+}
+
+void armVirtualPointerLocked(uint32_t w, uint32_t h)
+{
+    if (!g_state.overlayVisible || g_state.virtualPointerArmed || w == 0 || h == 0) {
+        return;
+    }
+    const PanelGeom g = makePanel(w, h);
+    const float seedX = (g.trackX0 + g.trackX1) * 0.5f;
+    const float seedY = g.intensityY + g.trackH * 0.5f;
+    setOverlayVirtualPointer(true, seedX, seedY);
+    g_state.virtualPointerArmed = true;
 }
 
 void handlePointerLocked(uint32_t w, uint32_t h)
@@ -188,12 +239,18 @@ void handlePointerLocked(uint32_t w, uint32_t h)
     const float row0Bot = g.intensityY + g.trackH + 12.0f;
     const float row1Top = g.shapeY - 12.0f;
     const float row1Bot = g.shapeY + g.trackH + 12.0f;
-    const float row2Top = g.colorY - 12.0f;
-    const float row2Bot = g.colorY + g.trackH + 12.0f;
+    const float row2Top = g.stretchY - 12.0f;
+    const float row2Bot = g.stretchY + g.trackH + 12.0f;
+    const float row3Top = g.floorY - 12.0f;
+    const float row3Bot = g.floorY + g.trackH + 12.0f;
+    const float row4Top = g.colorY - 12.0f;
+    const float row4Bot = g.colorY + g.trackH + 12.0f;
     const bool inPanel = ptr.x >= g.x0 && ptr.x <= g.x1 && ptr.y >= g.y0 && ptr.y <= g.y1;
     const bool inRow0 = inPanel && ptr.y >= row0Top && ptr.y <= row0Bot;
     const bool inRow1 = inPanel && ptr.y >= row1Top && ptr.y <= row1Bot;
     const bool inRow2 = inPanel && ptr.y >= row2Top && ptr.y <= row2Bot;
+    const bool inRow3 = inPanel && ptr.y >= row3Top && ptr.y <= row3Bot;
+    const bool inRow4 = inPanel && ptr.y >= row4Top && ptr.y <= row4Bot;
 
     if (!ptr.leftDown) {
         g_state.dragging = false;
@@ -208,6 +265,12 @@ void handlePointerLocked(uint32_t w, uint32_t h)
             g_state.focused = FocusedSlider::ExpansionShape;
             g_state.dragging = true;
         } else if (inRow2) {
+            g_state.focused = FocusedSlider::HighlightStretch;
+            g_state.dragging = true;
+        } else if (inRow3) {
+            g_state.focused = FocusedSlider::BlackFloor;
+            g_state.dragging = true;
+        } else if (inRow4) {
             g_state.focused = FocusedSlider::ColorIntensity;
             g_state.dragging = true;
         } else if (!inPanel) {
@@ -221,6 +284,10 @@ void handlePointerLocked(uint32_t w, uint32_t h)
             g_state.draft.intensity = t;
         } else if (g_state.focused == FocusedSlider::ColorIntensity) {
             g_state.draft.colorIntensity = t;
+        } else if (g_state.focused == FocusedSlider::BlackFloor) {
+            g_state.draft.blackFloor = t;
+        } else if (g_state.focused == FocusedSlider::HighlightStretch) {
+            g_state.draft.highlightStretch = t * 2.0f;
         } else {
             g_state.draft.expansionShape = t;
         }
@@ -271,7 +338,7 @@ void updateRuntimeUi(uint32_t extentWidth, uint32_t extentHeight, float /*output
         g_state.focused = prevSlider(g_state.focused);
     }
 
-    const float step = shift ? 0.01f : 0.05f;
+    const float step = adjustStepForFocused(g_state.focused, shift);
     if (anyKeyPressed({Key::Left}) && now - g_state.lastAdjust >= kAdjustDelay) {
         g_state.lastAdjust = now;
         adjustFocusedLocked(-step);
@@ -281,6 +348,7 @@ void updateRuntimeUi(uint32_t extentWidth, uint32_t extentHeight, float /*output
         adjustFocusedLocked(step);
     }
 
+    armVirtualPointerLocked(extentWidth, extentHeight);
     handlePointerLocked(extentWidth, extentHeight);
 }
 
@@ -324,6 +392,8 @@ OverlayDrawState overlayDrawState()
     s.intensity = g_state.draft.intensity;
     s.colorIntensity = g_state.draft.colorIntensity;
     s.expansionShape = g_state.draft.expansionShape;
+    s.blackFloor = g_state.draft.blackFloor;
+    s.highlightStretch = g_state.draft.highlightStretch;
     s.focused = static_cast<int>(g_state.focused);
     s.panelNits = 203.0f;
     s.pointerValid = g_state.pointerValid;

@@ -13,6 +13,7 @@ bool waylandKeysArePressed(const std::vector<uint32_t> &keys);
 bool waylandAnyKeyPressed(const std::vector<uint32_t> &keys);
 bool waylandActive();
 PointerState waylandQueryPointer(uint32_t extentW, uint32_t extentH);
+void waylandSetOverlayVirtualPointer(bool enabled, float seedX, float seedY);
 
 void pollInput()
 {
@@ -65,6 +66,13 @@ PointerState queryPointer(uint32_t extentW, uint32_t extentH)
         }
     }
     return x11QueryPointer(extentW, extentH);
+}
+
+void setOverlayVirtualPointer(bool enabled, float seedX, float seedY)
+{
+    if (waylandActive()) {
+        waylandSetOverlayVirtualPointer(enabled, seedX, seedY);
+    }
 }
 
 } // namespace AutoHdrVk

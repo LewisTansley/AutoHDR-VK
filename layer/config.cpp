@@ -56,11 +56,19 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     if (auto v = table["black_point"].value<double>()) {
         settings.blackPoint = AutoHdr::clampBlackPoint(static_cast<float>(*v));
     }
+    if (auto v = table["black_floor"].value<double>()) {
+        settings.blackFloor = AutoHdr::clampBlackFloor(static_cast<float>(*v));
+    } else if (auto v = table["black_point"].value<double>()) {
+        settings.blackFloor = AutoHdr::clampBlackFloor(static_cast<float>(*v) / 0.05f);
+    }
     if (auto v = table["color_intensity"].value<double>()) {
         settings.colorIntensity = AutoHdr::clampColorIntensity(static_cast<float>(*v));
     }
     if (auto v = table["expansion_shape"].value<double>()) {
         settings.expansionShape = AutoHdr::clampExpansionShape(static_cast<float>(*v));
+    }
+    if (auto v = table["highlight_stretch"].value<double>()) {
+        settings.highlightStretch = AutoHdr::clampHighlightStretch(static_cast<float>(*v));
     }
     if (auto v = table["gamut_expansion"].value<double>()) {
         settings.gamutExpansion = AutoHdr::clampGamutExpansion(static_cast<float>(*v));
@@ -96,8 +104,10 @@ void finalizeSettings(AutoHdr::CalibrationSettings &settings)
     settings.referenceNits = AutoHdr::clampReferenceNits(settings.referenceNits);
     settings.maxNits = std::max(settings.maxNits, settings.referenceNits);
     settings.blackPoint = AutoHdr::clampBlackPoint(settings.blackPoint);
+    settings.blackFloor = AutoHdr::clampBlackFloor(settings.blackFloor);
     settings.colorIntensity = AutoHdr::clampColorIntensity(settings.colorIntensity);
     settings.expansionShape = AutoHdr::clampExpansionShape(settings.expansionShape);
+    settings.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
     settings.gamutExpansion = AutoHdr::clampGamutExpansion(settings.gamutExpansion);
     settings.highlightSoftness = AutoHdr::clampHighlightSoftness(settings.highlightSoftness);
     settings.ditherStrength = AutoHdr::clampDitherStrength(settings.ditherStrength);
@@ -310,7 +320,8 @@ bool wantPreferHdrSwapchain()
     return g_config.preferHdrSwapchain;
 }
 
-bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape)
+bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float blackFloor,
+                         float highlightStretch)
 {
     std::lock_guard lock(g_configMutex);
     ensureLoaded();
@@ -318,16 +329,22 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
     intensity = AutoHdr::clampIntensity(intensity);
     colorIntensity = AutoHdr::clampColorIntensity(colorIntensity);
     expansionShape = AutoHdr::clampExpansionShape(expansionShape);
+    blackFloor = AutoHdr::clampBlackFloor(blackFloor);
+    highlightStretch = AutoHdr::clampHighlightStretch(highlightStretch);
 
     // Update in-memory first so subsequent activeSettings() sees the new values.
     if (Profile *profile = const_cast<Profile *>(matchingProfileLocked())) {
         profile->settings.intensity = intensity;
         profile->settings.colorIntensity = colorIntensity;
         profile->settings.expansionShape = expansionShape;
+        profile->settings.blackFloor = blackFloor;
+        profile->settings.highlightStretch = highlightStretch;
     } else {
         g_config.global.intensity = intensity;
         g_config.global.colorIntensity = colorIntensity;
         g_config.global.expansionShape = expansionShape;
+        g_config.global.blackFloor = blackFloor;
+        g_config.global.highlightStretch = highlightStretch;
     }
 
     if (g_config.configPath.empty()) {
@@ -362,6 +379,8 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table->insert_or_assign("intensity", static_cast<double>(intensity));
                 table->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
                 table->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+                table->insert_or_assign("black_floor", static_cast<double>(blackFloor));
+                table->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
                 updated = true;
                 break;
             }
@@ -371,6 +390,8 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table.insert("intensity", static_cast<double>(intensity));
                 table.insert("color_intensity", static_cast<double>(colorIntensity));
                 table.insert("expansion_shape", static_cast<double>(expansionShape));
+                table.insert("black_floor", static_cast<double>(blackFloor));
+                table.insert("highlight_stretch", static_cast<double>(highlightStretch));
                 arr->push_back(std::move(table));
             }
         } else {
@@ -382,6 +403,8 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
             global->insert_or_assign("intensity", static_cast<double>(intensity));
             global->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
             global->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+            global->insert_or_assign("black_floor", static_cast<double>(blackFloor));
+            global->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
         }
 
         const std::filesystem::path tmp = path.string() + ".tmp";

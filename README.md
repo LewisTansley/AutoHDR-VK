@@ -1,6 +1,6 @@
 # AutoHDR-VK
 
-DE-agnostic Vulkan implicit layer that applies **compute-based** AutoHDR-style SDR→HDR at `vkQueuePresentKHR` (histogram adaptation, UI mask, BT.2446 + ICtCp). Works with native Vulkan apps and DXVK/vkd3d (Proton) under any compositor that can present HDR.
+DE-agnostic Vulkan implicit layer that applies **compute-based** AutoHDR-style SDR→HDR at `vkQueuePresentKHR` (histogram range adaptation, UI mask, tone LUT + perceptual color). Works with native Vulkan apps and DXVK/vkd3d (Proton) under any compositor that can present HDR.
 
 This does **not** replace the Plasma KWin effect. It only processes **Vulkan clients**.
 
@@ -10,7 +10,7 @@ Related: [PlasmaAutoHDR](https://github.com/LewisTansley/PlasmaAutoHDR) (KWin de
 
 - Linux, Vulkan 1.2+ ICD (Mesa / NVIDIA)
 - `glslangValidator` to build
-- Build deps: `libX11`, `wayland-client`, `libxkbcommon` (for in-game overlay hotkeys)
+- Build deps: `libX11`, `wayland-client`, `libxkbcommon`, `wayland-protocols`, `wayland-scanner` (for in-game overlay hotkeys)
 - An HDR-capable presentation path for correct results (KWin HDR, gamescope HDR, Hyprland HDR, etc.)
 
 ### Compositor notes
@@ -70,17 +70,17 @@ Force off: `DISABLE_AUTOHDR=1`.
 
 | Hotkey | Action |
 |---|---|
-| **Super+H** (Shift optional) | Toggle calibrator overlay (Intensity + Shape + Color sliders) |
+| **Super+H** (Shift optional) | Toggle calibrator overlay (Intensity + Shape + Stretch + Floor + Color sliders) |
 
 While the overlay is open:
 
-- **Up/Down** or **Tab** — cycle Intensity / Shape (`expansion_shape`) / Color (`color_intensity`)
-- **Left/Right** — adjust ±0.05 (hold **Shift** for ±0.01)
+- **Up/Down** or **Tab** — cycle Intensity / Shape (`expansion_shape`) / Stretch (`highlight_stretch`) / Floor (`black_floor`) / Color (`color_intensity`)
+- **Left/Right** — adjust ±0.05 (hold **Shift** for ±0.01); **Floor** uses finer steps (±0.005, Shift ±0.001)
 - **Super+H** again — close and save to `conf.toml`
 - **Esc** — close and discard changes
-- Mouse drag on tracks works on X11/XWayland when the pointer is visible
+- Mouse drag on slider tracks (X11/XWayland absolute pointer, or Wayland/Proton Wayland via a virtual HUD cursor when the game locks the mouse)
 
-Hotkeys work on **X11**, **XWayland**, and **native Wayland** (including Proton with `PROTON_ENABLE_WAYLAND=1`) via the app’s Wayland seat + xkbcommon.
+Hotkeys work on **X11**, **XWayland**, and **native Wayland** (including Proton with `PROTON_ENABLE_WAYLAND=1`) via the app’s Wayland seat + xkbcommon. On Wayland, opening the overlay seeds a virtual cursor on the panel and drives it from `zwp_relative_pointer` so locked-mouse games (FPS look) can still drag sliders.
 
 ## Configuration
 
@@ -98,6 +98,8 @@ Important keys under `[global]`:
 - **`intensity`** — primary look control (Windows AutoHDR-style): `0` ≈ SDR, `1` = full peak headroom. Linear blend toward the tonemapped result.
 - **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full chroma restore and full `gamut_expansion`). Overlay **Color** slider.
 - **`expansion_shape`** — shadow→highlight curve shape (`0` = linear / brighter mids, `1` = exponential / darker mids). Overlay **Shape** slider.
+- **`black_floor`** — raised-floor black crush (`0` = off, `1` = max). Overlay **Floor** slider. Use when a game's blacks look lifted/foggy.
+- **`highlight_stretch`** — histogram highlight pre-stretch (`0` = off, `0.45` = default, `1` = legacy max, `2` = aggressive). Overlay **Stretch** slider. Raise for muted masters (e.g. Big Walk) where near-whites sit below peak.
 - `encoding` — `auto` (prefer PQ on HDR10 swapchains, else SDR preview), `pq`, `scrgb`, `sdr_preview`
 - `prefer_hdr_swapchain` — try to select an HDR10 surface format/colorspace at swapchain create
 - `set_hdr_metadata` — call `vkSetHdrMetadataEXT` when available (maxCLL/maxFALL from scene stats)
@@ -126,10 +128,10 @@ App / DXVK → Vulkan loader → VK_LAYER_AUTOHDR_tonemap → ICD → WSI → co
 
 On present, the layer copies the swapchain image and runs a compute pipeline:
 
-1. **Histogram** — scene luminance stats (geo-mean, p10/p90, adaptive peak)
+1. **Histogram** — scene luminance stats (geo-mean, p05/p25/p90/near-max); mild highlight-tail pre-stretch when content white is below peak; maxCLL/maxFALL for HDR metadata
 2. **UI cluster** — 8×8 tile mask to lock flat UI/text to SDR white
 3. **Base blur** — half-res linear base layer for detail preservation
-4. **Tonemap** — BT.2446 + ICtCp spatial tonemap (base/detail split), UI mask blend, PQ/scRGB/SDR encode
+4. **Tonemap** — tone LUT + perceptual color path with histogram range adapt, UI mask blend, PQ/scRGB/SDR encode
 5. **Overlay** (optional) — in-swapchain intensity/color calibrator HUD
 
 Then the result is blitted back to the swapchain for present.
@@ -138,7 +140,7 @@ Then the result is blitted back to the swapchain for present.
 
 - Vulkan only (OpenGL needs Zink or a separate hook)
 - No AI guidance (Plasma AutoHDR optional AI path is not ported)
-- Overlay mouse drag is X11/XWayland only; keyboard works on all backends
+- Overlay mouse: X11/XWayland use absolute pointer when visible; Wayland uses a relative-pointer virtual cursor while the overlay is open (falls back to keyboard if the compositor lacks relative-pointer)
 - Some anti-cheat systems dislike Vulkan layers
 - Flatpak/Steam Runtime may need the layer visible inside the sandbox (`VK_LAYER_PATH` / Flatpak extension)
 

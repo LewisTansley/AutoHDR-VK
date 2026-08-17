@@ -12,10 +12,16 @@ color_intensity = 0.33
 # Shadow→highlight expansion shape (0 = linear, 1 = exponential). Overlay "Shape" slider.
 expansion_shape = 0.55
 
+# Raised-floor black crush (0 = off, 1 = max). Overlay "Floor" slider.
+black_floor = 0.0
+
+# Histogram highlight pre-stretch (0 = off, 0.45 = default, 1 = legacy max, 2 = aggressive). Overlay "Stretch" slider.
+highlight_stretch = 0.45
+
 # Advanced overrides (optional; kept for back-compat)
 # reference_nits = 203
 # peak_nits = 1000
-# black_point = 0.0
+# black_point = 0.0   # legacy linear offset; prefer black_floor
 # gamut_expansion = 1.0   # max expand scale when color_intensity = 1
 # highlight_softness = 0.30
 # perceptual_color = true

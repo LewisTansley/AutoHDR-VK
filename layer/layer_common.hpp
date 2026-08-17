@@ -11,6 +11,7 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -66,6 +67,7 @@ struct DeviceDispatch {
     PFN_vkCreateImage CreateImage = nullptr;
     PFN_vkDestroyImage DestroyImage = nullptr;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
+    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout = nullptr;
     PFN_vkAllocateMemory AllocateMemory = nullptr;
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkBindImageMemory BindImageMemory = nullptr;
@@ -98,6 +100,7 @@ struct DeviceDispatch {
     PFN_vkBeginCommandBuffer BeginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
+    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
     PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
     PFN_vkCmdDispatch CmdDispatch = nullptr;
@@ -128,13 +131,17 @@ struct ToneParamsUBO {
     float outputMode = 0.0f;
     float inputIsSrgb = 1.0f;
     float intensity = 0.5f;
+    float highlightStretch = 0.45f;
     float ditherStrength = 1.0f;
+    float _padTone[3] = {0.0f, 0.0f, 0.0f}; // std140: pad 48→64 before vec4
     float pqBoostParams[4] = {10000.0f, 10000.0f, 1.0f, 0.0f};
     uint32_t extentWidth = 0;
     uint32_t extentHeight = 0;
     uint32_t outputBits = 10;
     uint32_t _padBits = 0;
 };
+static_assert(sizeof(ToneParamsUBO) == 96, "ToneParamsUBO must match std140 tonemap.comp ToneParams");
+static_assert(offsetof(ToneParamsUBO, extentWidth) == 80, "ToneParamsUBO extent must be at std140 offset 80");
 
 // std140 layout — must match shaders/overlay.comp OverlayParams
 struct OverlayParamsUBO {
@@ -149,8 +156,8 @@ struct OverlayParamsUBO {
     float pointerValid = 0.0f;
     float pointerX = 0.0f;
     float pointerY = 0.0f;
-    float _pad0 = 0.0f;
-    float _pad1 = 0.0f;
+    float blackFloor = 0.0f;
+    float highlightStretch = 0.45f;
 };
 
 struct HistParamsUBO {
@@ -191,11 +198,11 @@ struct BlurParamsUBO {
 
 struct SceneStatsGPU {
     float geoMean = 0.18f;
-    float p10 = 0.05f;
+    float p10 = 0.02f; // p05 floor candidate
     float p90 = 0.45f;
-    float k1 = 0.83f;
+    float p98 = 0.95f; // near-max content white (see histogram_pass2)
+    float k1 = 0.08f;  // p25 bulk shadow for flatness
     float effectivePeak = 1000.0f;
-    float exposure = 1.0f;
     float maxCLL = 1000.0f;
     float maxFALL = 203.0f;
     uint32_t initialized = 0;
@@ -204,8 +211,17 @@ struct SceneStatsGPU {
     uint32_t _pad2 = 0;
 };
 
+struct PresentParamsUBO {
+    uint32_t extentWidth = 0;
+    uint32_t extentHeight = 0;
+    uint32_t rgb10PackMode = 0; // 0 = A2B10G10R10, 1 = A2R10G10B10
+    uint32_t unormBgra = 0;     // 0 = RGBA, 1 = BGRA (8-bit present)
+};
+static_assert(sizeof(PresentParamsUBO) == 16, "PresentParamsUBO must match std140 present shaders");
+
 struct SwapchainImageResources {
     VkImage swapImage = VK_NULL_HANDLE;
+    VkImageView swapStorageView = VK_NULL_HANDLE; // R32_UINT view for present_rgb10
     VkImage srcImage = VK_NULL_HANDLE; // copy of swap for sampling
     VkDeviceMemory srcMemory = VK_NULL_HANDLE;
     VkImageView srcView = VK_NULL_HANDLE;
@@ -218,6 +234,7 @@ struct SwapchainImageResources {
     VkDescriptorSet uiClusterSet = VK_NULL_HANDLE;
     VkDescriptorSet baseBlurSet = VK_NULL_HANDLE;
     VkDescriptorSet overlaySet = VK_NULL_HANDLE;
+    VkDescriptorSet presentSet = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore doneSemaphore = VK_NULL_HANDLE;
@@ -243,6 +260,8 @@ struct SwapchainData {
     bool hdrColorspace = false;
     bool inputIsSrgb = true;
     OutputEncoding encoding = OutputEncoding::SdrPreview;
+    uint32_t presentRgb10PackMode = 0;
+    bool presentUnormBgra = false;
 
     VkBuffer histBuffer = VK_NULL_HANDLE;
     VkDeviceMemory histMemory = VK_NULL_HANDLE;
@@ -264,6 +283,7 @@ struct DeviceData {
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
+    VkSampler fontSampler = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout tonemapSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout tonemapPipelineLayout = VK_NULL_HANDLE;
@@ -288,6 +308,11 @@ struct DeviceData {
     VkDescriptorSetLayout overlaySetLayout = VK_NULL_HANDLE;
     VkPipelineLayout overlayPipelineLayout = VK_NULL_HANDLE;
     VkPipeline overlayPipeline = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout presentSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout presentPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline presentPipeline = VK_NULL_HANDLE;
+    VkPipeline presentUnormPipeline = VK_NULL_HANDLE;
 
     VkBuffer lutBuffer = VK_NULL_HANDLE;
     VkDeviceMemory lutMemory = VK_NULL_HANDLE;
@@ -316,6 +341,15 @@ struct DeviceData {
     VkBuffer overlayParamsBuffer = VK_NULL_HANDLE;
     VkDeviceMemory overlayParamsMemory = VK_NULL_HANDLE;
     void *overlayParamsMapped = nullptr;
+
+    VkBuffer presentParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory presentParamsMemory = VK_NULL_HANDLE;
+    void *presentParamsMapped = nullptr;
+
+    VkImage overlayFontImage = VK_NULL_HANDLE;
+    VkDeviceMemory overlayFontMemory = VK_NULL_HANDLE;
+    VkImageView overlayFontView = VK_NULL_HANDLE;
+    VkImageLayout overlayFontLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     bool pipelineReady = false;
     bool hdrMetadataExt = false;

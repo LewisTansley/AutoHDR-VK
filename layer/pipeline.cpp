@@ -8,6 +8,9 @@
 #include "histogram_pass1.comp.spv.h"
 #include "histogram_pass2.comp.spv.h"
 #include "overlay.comp.spv.h"
+#include "overlay_font_atlas.h"
+#include "present_rgb10.comp.spv.h"
+#include "present_unorm.comp.spv.h"
 #include "tonemap.comp.spv.h"
 #include "ui_cluster.comp.spv.h"
 
@@ -142,6 +145,178 @@ bool createDeviceImage(DeviceData *dev, VkExtent2D extent, VkFormat format, VkIm
     return d.CreateImageView(dev->device, &viewInfo, nullptr, &view) == VK_SUCCESS;
 }
 
+bool submitOneTimeCommands(DeviceData *dev, VkCommandBuffer cmd)
+{
+    auto &d = dev->dispatch;
+    if (dev->graphicsQueue == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    if (d.CreateFence(dev->device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    const VkResult submitResult = d.QueueSubmit(dev->graphicsQueue, 1, &submit, fence);
+    if (submitResult != VK_SUCCESS) {
+        d.DestroyFence(dev->device, fence, nullptr);
+        return false;
+    }
+    if (d.WaitForFences(dev->device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        d.DestroyFence(dev->device, fence, nullptr);
+        return false;
+    }
+    d.DestroyFence(dev->device, fence, nullptr);
+    return true;
+}
+
+bool uploadOptimalSampledRgbaImage(DeviceData *dev, VkExtent2D extent, const uint8_t *pixels, VkDeviceSize rowBytes,
+                                   VkImage &image, VkDeviceMemory &memory, VkImageView &view, VkImageLayout &outLayout)
+{
+    auto &d = dev->dispatch;
+    image = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+    view = VK_NULL_HANDLE;
+
+    if (!createDeviceImage(dev, extent, VK_FORMAT_R8G8B8A8_UNORM,
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, image, memory, view)) {
+        return false;
+    }
+
+    const VkDeviceSize tightRowBytes = static_cast<VkDeviceSize>(extent.width * 4u);
+    const VkDeviceSize bufferSize = tightRowBytes * extent.height;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    void *stagingMapped = nullptr;
+    if (!createHostBuffer(dev, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stagingBuffer, stagingMemory,
+                          &stagingMapped)) {
+        d.DestroyImageView(dev->device, view, nullptr);
+        d.DestroyImage(dev->device, image, nullptr);
+        d.FreeMemory(dev->device, memory, nullptr);
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        view = VK_NULL_HANDLE;
+        return false;
+    }
+
+    auto *dst = static_cast<uint8_t *>(stagingMapped);
+    for (uint32_t y = 0; y < extent.height; ++y) {
+        std::memcpy(dst + y * tightRowBytes, pixels + y * rowBytes, static_cast<size_t>(tightRowBytes));
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmdAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cmdAlloc.commandPool = dev->commandPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    if (d.AllocateCommandBuffers(dev->device, &cmdAlloc, &cmd) != VK_SUCCESS) {
+        d.UnmapMemory(dev->device, stagingMemory);
+        d.DestroyBuffer(dev->device, stagingBuffer, nullptr);
+        d.FreeMemory(dev->device, stagingMemory, nullptr);
+        d.DestroyImageView(dev->device, view, nullptr);
+        d.DestroyImage(dev->device, image, nullptr);
+        d.FreeMemory(dev->device, memory, nullptr);
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        view = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d.BeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    d.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {extent.width, extent.height, 1};
+    d.CmdCopyBufferToImage(cmd, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    d.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+
+    d.EndCommandBuffer(cmd);
+    const bool ok = submitOneTimeCommands(dev, cmd);
+    d.FreeCommandBuffers(dev->device, dev->commandPool, 1, &cmd);
+    d.UnmapMemory(dev->device, stagingMemory);
+    d.DestroyBuffer(dev->device, stagingBuffer, nullptr);
+    d.FreeMemory(dev->device, stagingMemory, nullptr);
+
+    if (!ok) {
+        d.DestroyImageView(dev->device, view, nullptr);
+        d.DestroyImage(dev->device, image, nullptr);
+        d.FreeMemory(dev->device, memory, nullptr);
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        view = VK_NULL_HANDLE;
+        return false;
+    }
+
+    outLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return true;
+}
+
+bool uploadOverlayFontAtlas(DeviceData *dev)
+{
+    if (dev->overlayFontView != VK_NULL_HANDLE) {
+        return true;
+    }
+    if (dev->graphicsQueue == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    const VkExtent2D extent{kOverlayFontAtlasWidth, kOverlayFontAtlasHeight};
+    const VkDeviceSize rowBytes = static_cast<VkDeviceSize>(extent.width * 4u);
+    if (uploadOptimalSampledRgbaImage(dev, extent, kOverlayFontAtlasRgba, rowBytes, dev->overlayFontImage,
+                                      dev->overlayFontMemory, dev->overlayFontView, dev->overlayFontLayout)) {
+        return true;
+    }
+
+    logf("overlay font atlas upload failed");
+    static const uint8_t kFallbackPixel[4] = {255, 255, 255, 255};
+    const VkExtent2D fallbackExtent{1, 1};
+    return uploadOptimalSampledRgbaImage(dev, fallbackExtent, kFallbackPixel, 4, dev->overlayFontImage,
+                                         dev->overlayFontMemory, dev->overlayFontView, dev->overlayFontLayout);
+}
+
+bool isRgb10SwapFormat(VkFormat format)
+{
+    return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
+bool isUnorm8SwapFormat(VkFormat format)
+{
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM
+        || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+uint32_t rgb10PackModeForFormat(VkFormat format)
+{
+    return format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? 1u : 0u;
+}
+
+bool unormBgraForFormat(VkFormat format)
+{
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
 bool createComputePipeline(DeviceData *dev, const uint32_t *spv, size_t spvSize, VkPipelineLayout layout,
                            VkPipeline &pipeline)
 {
@@ -258,17 +433,18 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     }
 
     ToneParamsUBO ubo{};
-    ubo.blackPoint = settings.blackPoint;
+    ubo.blackPoint = AutoHdr::blackFloorToBlackPoint(settings.blackFloor);
     ubo.colorIntensity = std::clamp(settings.colorIntensity, 0.0f, 1.0f);
     ubo.gamutExpansion = settings.gamutExpansion;
     ubo.referenceNits = settings.referenceNits;
-    // Peak is full panel/ABL target — intensity is applied as a post-map mix in the shader.
+    // User-configured peak — intensity is applied as a post-map mix in the shader.
     ubo.peakNits = settings.maxNits;
     ubo.toneCurveInputSpan = span;
     ubo.highlightSoftness = settings.highlightSoftness;
     ubo.perceptualColorEnabled = settings.perceptualColor ? 1.0f : 0.0f;
     ubo.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
     ubo.intensity = intensity;
+    ubo.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
     ubo.ditherStrength = settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
     switch (encoding) {
     case OutputEncoding::LinearScRgb:
@@ -306,10 +482,9 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
         adaptParams.referenceNits = settings.referenceNits;
         adaptParams.peakNits = settings.maxNits;
         adaptParams.sdrWhiteNits = 80.0f;
-        // Prefer slower brighten so dark→bright hist swings don't flash the lobby washed-out.
-        // Faster darken so title/lobby snaps peak down instead of lingering blown-out.
-        adaptParams.adaptBrighten = 0.12f;
-        adaptParams.adaptDarken = 0.18f;
+        // Temporal smoothing for geo-mean / p10 / p90 / p98 / k1 scene stats.
+        adaptParams.adaptBrighten = 0.010f;
+        adaptParams.adaptDarken = 0.015f;
         adaptParams.temporalEnable = 1.0f;
         std::memcpy(dev->adaptParamsMapped, &adaptParams, sizeof(adaptParams));
     }
@@ -372,6 +547,14 @@ void destroyDeviceResources(DeviceData *dev)
         d.DestroyPipeline(dev->device, dev->overlayPipeline, nullptr);
         dev->overlayPipeline = VK_NULL_HANDLE;
     }
+    if (dev->presentPipeline) {
+        d.DestroyPipeline(dev->device, dev->presentPipeline, nullptr);
+        dev->presentPipeline = VK_NULL_HANDLE;
+    }
+    if (dev->presentUnormPipeline) {
+        d.DestroyPipeline(dev->device, dev->presentUnormPipeline, nullptr);
+        dev->presentUnormPipeline = VK_NULL_HANDLE;
+    }
     if (dev->tonemapPipelineLayout) {
         d.DestroyPipelineLayout(dev->device, dev->tonemapPipelineLayout, nullptr);
         dev->tonemapPipelineLayout = VK_NULL_HANDLE;
@@ -396,6 +579,10 @@ void destroyDeviceResources(DeviceData *dev)
         d.DestroyPipelineLayout(dev->device, dev->overlayPipelineLayout, nullptr);
         dev->overlayPipelineLayout = VK_NULL_HANDLE;
     }
+    if (dev->presentPipelineLayout) {
+        d.DestroyPipelineLayout(dev->device, dev->presentPipelineLayout, nullptr);
+        dev->presentPipelineLayout = VK_NULL_HANDLE;
+    }
     if (dev->tonemapSetLayout) {
         d.DestroyDescriptorSetLayout(dev->device, dev->tonemapSetLayout, nullptr);
         dev->tonemapSetLayout = VK_NULL_HANDLE;
@@ -419,6 +606,14 @@ void destroyDeviceResources(DeviceData *dev)
     if (dev->overlaySetLayout) {
         d.DestroyDescriptorSetLayout(dev->device, dev->overlaySetLayout, nullptr);
         dev->overlaySetLayout = VK_NULL_HANDLE;
+    }
+    if (dev->presentSetLayout) {
+        d.DestroyDescriptorSetLayout(dev->device, dev->presentSetLayout, nullptr);
+        dev->presentSetLayout = VK_NULL_HANDLE;
+    }
+    if (dev->fontSampler) {
+        d.DestroySampler(dev->device, dev->fontSampler, nullptr);
+        dev->fontSampler = VK_NULL_HANDLE;
     }
     if (dev->sampler) {
         d.DestroySampler(dev->device, dev->sampler, nullptr);
@@ -512,6 +707,31 @@ void destroyDeviceResources(DeviceData *dev)
         d.FreeMemory(dev->device, dev->overlayParamsMemory, nullptr);
         dev->overlayParamsMemory = VK_NULL_HANDLE;
     }
+    if (dev->presentParamsMapped) {
+        d.UnmapMemory(dev->device, dev->presentParamsMemory);
+        dev->presentParamsMapped = nullptr;
+    }
+    if (dev->presentParamsBuffer) {
+        d.DestroyBuffer(dev->device, dev->presentParamsBuffer, nullptr);
+        dev->presentParamsBuffer = VK_NULL_HANDLE;
+    }
+    if (dev->presentParamsMemory) {
+        d.FreeMemory(dev->device, dev->presentParamsMemory, nullptr);
+        dev->presentParamsMemory = VK_NULL_HANDLE;
+    }
+    if (dev->overlayFontView) {
+        d.DestroyImageView(dev->device, dev->overlayFontView, nullptr);
+        dev->overlayFontView = VK_NULL_HANDLE;
+    }
+    if (dev->overlayFontImage) {
+        d.DestroyImage(dev->device, dev->overlayFontImage, nullptr);
+        dev->overlayFontImage = VK_NULL_HANDLE;
+    }
+    if (dev->overlayFontMemory) {
+        d.FreeMemory(dev->device, dev->overlayFontMemory, nullptr);
+        dev->overlayFontMemory = VK_NULL_HANDLE;
+    }
+    dev->overlayFontLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (dev->commandPool) {
         d.DestroyCommandPool(dev->device, dev->commandPool, nullptr);
         dev->commandPool = VK_NULL_HANDLE;
@@ -545,6 +765,16 @@ bool ensureDeviceResources(DeviceData *dev)
         return false;
     }
 
+    VkSamplerCreateInfo fontSamp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    fontSamp.magFilter = VK_FILTER_NEAREST;
+    fontSamp.minFilter = VK_FILTER_NEAREST;
+    fontSamp.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    fontSamp.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    fontSamp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (d.CreateSampler(dev->device, &fontSamp, nullptr, &dev->fontSampler) != VK_SUCCESS) {
+        return false;
+    }
+
     if (!createHostBuffer(dev, sizeof(ToneParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->uboBuffer,
                           dev->uboMemory, &dev->uboMapped)) {
         return false;
@@ -571,6 +801,10 @@ bool ensureDeviceResources(DeviceData *dev)
     }
     if (!createHostBuffer(dev, sizeof(OverlayParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->overlayParamsBuffer,
                           dev->overlayParamsMemory, &dev->overlayParamsMapped)) {
+        return false;
+    }
+    if (!createHostBuffer(dev, sizeof(PresentParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->presentParamsBuffer,
+                          dev->presentParamsMemory, &dev->presentParamsMapped)) {
         return false;
     }
 
@@ -703,7 +937,7 @@ bool ensureDeviceResources(DeviceData *dev)
     }
 
     {
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -712,11 +946,38 @@ bool ensureDeviceResources(DeviceData *dev)
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 3;
         layoutInfo.pBindings = bindings;
         if (d.CreateDescriptorSetLayout(dev->device, &layoutInfo, nullptr, &dev->overlaySetLayout) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    {
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = 3;
+        layoutInfo.pBindings = bindings;
+        if (d.CreateDescriptorSetLayout(dev->device, &layoutInfo, nullptr, &dev->presentSetLayout) != VK_SUCCESS) {
             return false;
         }
     }
@@ -769,6 +1030,14 @@ bool ensureDeviceResources(DeviceData *dev)
             return false;
         }
     }
+    {
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &dev->presentSetLayout;
+        if (d.CreatePipelineLayout(dev->device, &layoutInfo, nullptr, &dev->presentPipelineLayout) != VK_SUCCESS) {
+            return false;
+        }
+    }
 
     if (!createComputePipeline(dev, tonemap_comp_spv, sizeof(tonemap_comp_spv), dev->tonemapPipelineLayout,
                                dev->tonemapPipeline)) {
@@ -794,6 +1063,19 @@ bool ensureDeviceResources(DeviceData *dev)
                                dev->overlayPipeline)) {
         return false;
     }
+    if (!createComputePipeline(dev, present_rgb10_comp_spv, sizeof(present_rgb10_comp_spv), dev->presentPipelineLayout,
+                               dev->presentPipeline)) {
+        return false;
+    }
+    if (!createComputePipeline(dev, present_unorm_comp_spv, sizeof(present_unorm_comp_spv), dev->presentPipelineLayout,
+                               dev->presentUnormPipeline)) {
+        return false;
+    }
+
+    d.GetDeviceQueue(dev->device, dev->graphicsQueueFamily, 0, &dev->graphicsQueue);
+    if (!uploadOverlayFontAtlas(dev)) {
+        logf("overlay font unavailable; labels may be missing");
+    }
 
     VkDescriptorPoolSize sizes[4]{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -812,9 +1094,8 @@ bool ensureDeviceResources(DeviceData *dev)
         return false;
     }
 
-    d.GetDeviceQueue(dev->device, dev->graphicsQueueFamily, 0, &dev->graphicsQueue);
     dev->pipelineReady = true;
-    logf("compute pipelines ready (hist+ui+blur+legacyTone+overlay)");
+    logf("compute pipelines ready (hist+ui+blur+legacyTone+overlay+present+presentUnorm)");
     return true;
 }
 
@@ -905,12 +1186,17 @@ void destroySwapchainResources(DeviceData *dev, SwapchainData &sc)
             d.FreeMemory(dev->device, img.dstMemory, nullptr);
             img.dstMemory = VK_NULL_HANDLE;
         }
+        if (img.swapStorageView) {
+            d.DestroyImageView(dev->device, img.swapStorageView, nullptr);
+            img.swapStorageView = VK_NULL_HANDLE;
+        }
         img.tonemapSet = VK_NULL_HANDLE;
         img.histPass1Set = VK_NULL_HANDLE;
         img.histPass2Set = VK_NULL_HANDLE;
         img.uiClusterSet = VK_NULL_HANDLE;
         img.baseBlurSet = VK_NULL_HANDLE;
         img.overlaySet = VK_NULL_HANDLE;
+        img.presentSet = VK_NULL_HANDLE;
     }
     sc.images.clear();
     sc.maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -940,6 +1226,8 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
 
     sc.halfExtent.width = std::max(1u, sc.extent.width / 2u);
     sc.halfExtent.height = std::max(1u, sc.extent.height / 2u);
+    sc.presentRgb10PackMode = rgb10PackModeForFormat(sc.format);
+    sc.presentUnormBgra = unormBgraForFormat(sc.format);
 
     if (!createDeviceImage(dev, sc.halfExtent, kBaseFormat,
                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, sc.baseImage, sc.baseMemory,
@@ -970,18 +1258,32 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
             return false;
         }
         if (!createDeviceImage(dev, sc.extent, kComputeDstFormat,
-                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, res.dstImage,
-                               res.dstMemory, res.dstView)) {
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               res.dstImage, res.dstMemory, res.dstView)) {
             return false;
         }
 
-        VkDescriptorSetLayout layouts[6] = {dev->tonemapSetLayout,  dev->histPass1SetLayout,  dev->histPass2SetLayout,
-                                            dev->uiClusterSetLayout, dev->baseBlurSetLayout,   dev->overlaySetLayout};
+        if (isRgb10SwapFormat(sc.format) || isUnorm8SwapFormat(sc.format)) {
+            VkImageViewCreateInfo storageViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            storageViewInfo.image = res.swapImage;
+            storageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            storageViewInfo.format = VK_FORMAT_R32_UINT;
+            storageViewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (d.CreateImageView(dev->device, &storageViewInfo, nullptr, &res.swapStorageView) != VK_SUCCESS) {
+                return false;
+            }
+        }
+
+        const bool hasPresentPipeline = dev->presentPipeline != VK_NULL_HANDLE || dev->presentUnormPipeline != VK_NULL_HANDLE;
+        const uint32_t setCount = hasPresentPipeline ? 7u : 6u;
+        VkDescriptorSetLayout layouts[7] = {dev->tonemapSetLayout,  dev->histPass1SetLayout,  dev->histPass2SetLayout,
+                                            dev->uiClusterSetLayout, dev->baseBlurSetLayout, dev->overlaySetLayout,
+                                            dev->presentSetLayout};
         VkDescriptorSetAllocateInfo dsAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsAlloc.descriptorPool = dev->descriptorPool;
-        dsAlloc.descriptorSetCount = 6;
+        dsAlloc.descriptorSetCount = setCount;
         dsAlloc.pSetLayouts = layouts;
-        VkDescriptorSet sets[6]{};
+        VkDescriptorSet sets[7]{};
         if (d.AllocateDescriptorSets(dev->device, &dsAlloc, sets) != VK_SUCCESS) {
             return false;
         }
@@ -991,6 +1293,9 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
         res.uiClusterSet = sets[3];
         res.baseBlurSet = sets[4];
         res.overlaySet = sets[5];
+        if (setCount == 7u) {
+            res.presentSet = sets[6];
+        }
 
         VkDescriptorImageInfo srcSampleInfo{};
         srcSampleInfo.sampler = dev->sampler;
@@ -1049,6 +1354,10 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
         VkDescriptorBufferInfo overlayParamsInfo{};
         overlayParamsInfo.buffer = dev->overlayParamsBuffer;
         overlayParamsInfo.range = sizeof(OverlayParamsUBO);
+
+        VkDescriptorBufferInfo presentParamsInfo{};
+        presentParamsInfo.buffer = dev->presentParamsBuffer;
+        presentParamsInfo.range = sizeof(PresentParamsUBO);
 
         VkWriteDescriptorSet tonemapWrites[6]{};
         tonemapWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1174,7 +1483,7 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
         d.UpdateDescriptorSets(dev->device, 3, uiClusterWrites, 0, nullptr);
         d.UpdateDescriptorSets(dev->device, 3, baseBlurWrites, 0, nullptr);
 
-        VkWriteDescriptorSet overlayWrites[2]{};
+        VkWriteDescriptorSet overlayWrites[3]{};
         overlayWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         overlayWrites[0].dstSet = res.overlaySet;
         overlayWrites[0].dstBinding = 0;
@@ -1187,7 +1496,54 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
         overlayWrites[1].descriptorCount = 1;
         overlayWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         overlayWrites[1].pImageInfo = &storageInfo;
-        d.UpdateDescriptorSets(dev->device, 2, overlayWrites, 0, nullptr);
+
+        VkDescriptorImageInfo fontInfo{};
+        uint32_t overlayWriteCount = 2;
+        if (dev->overlayFontView != VK_NULL_HANDLE && dev->fontSampler != VK_NULL_HANDLE) {
+            fontInfo.sampler = dev->fontSampler;
+            fontInfo.imageView = dev->overlayFontView;
+            fontInfo.imageLayout = dev->overlayFontLayout;
+            overlayWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            overlayWrites[2].dstSet = res.overlaySet;
+            overlayWrites[2].dstBinding = 2;
+            overlayWrites[2].descriptorCount = 1;
+            overlayWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            overlayWrites[2].pImageInfo = &fontInfo;
+            overlayWriteCount = 3;
+        }
+        d.UpdateDescriptorSets(dev->device, overlayWriteCount, overlayWrites, 0, nullptr);
+
+        if (res.presentSet != VK_NULL_HANDLE && res.swapStorageView != VK_NULL_HANDLE) {
+            VkDescriptorImageInfo presentInputInfo{};
+            presentInputInfo.sampler = dev->sampler;
+            presentInputInfo.imageView = res.dstView;
+            presentInputInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo presentOutputInfo{};
+            presentOutputInfo.imageView = res.swapStorageView;
+            presentOutputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet presentWrites[3]{};
+            presentWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            presentWrites[0].dstSet = res.presentSet;
+            presentWrites[0].dstBinding = 0;
+            presentWrites[0].descriptorCount = 1;
+            presentWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            presentWrites[0].pImageInfo = &presentInputInfo;
+            presentWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            presentWrites[1].dstSet = res.presentSet;
+            presentWrites[1].dstBinding = 1;
+            presentWrites[1].descriptorCount = 1;
+            presentWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            presentWrites[1].pImageInfo = &presentOutputInfo;
+            presentWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            presentWrites[2].dstSet = res.presentSet;
+            presentWrites[2].dstBinding = 2;
+            presentWrites[2].descriptorCount = 1;
+            presentWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            presentWrites[2].pBufferInfo = &presentParamsInfo;
+            d.UpdateDescriptorSets(dev->device, 3, presentWrites, 0, nullptr);
+        }
 
         VkCommandBufferAllocateInfo cmdAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cmdAlloc.commandPool = dev->commandPool;
@@ -1209,8 +1565,9 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
     }
 
     sc.active = true;
-    logf("swapchain resources created (%u images %ux%u, hist+ui+blur+legacyTone)", count, sc.extent.width,
-         sc.extent.height);
+    logf("swapchain resources created (%u images %ux%u format=%u rgb10Pack=%u unormBgra=%u)", count, sc.extent.width,
+         sc.extent.height, static_cast<unsigned>(sc.format), sc.presentRgb10PackMode,
+         sc.presentUnormBgra ? 1u : 0u);
     return true;
 }
 
@@ -1271,6 +1628,8 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         overlayUbo.pointerValid = hud.pointerValid ? 1.0f : 0.0f;
         overlayUbo.pointerX = hud.pointerX;
         overlayUbo.pointerY = hud.pointerY;
+        overlayUbo.blackFloor = hud.blackFloor;
+        overlayUbo.highlightStretch = hud.highlightStretch;
         uploadOverlayParams(dev, overlayUbo);
     }
 
@@ -1518,20 +1877,69 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     blit.dstSubresource = blit.srcSubresource;
     blit.srcOffsets[1] = {static_cast<int32_t>(sc.extent.width), static_cast<int32_t>(sc.extent.height), 1};
     blit.dstOffsets[1] = blit.srcOffsets[1];
-    d.CmdBlitImage(res.cmd, res.dstImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, res.swapImage,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 
-    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barriers[0].dstAccessMask = 0;
-    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barriers[0].image = res.swapImage;
-    d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, barriers);
+    const bool usePresentRgb10 =
+        isRgb10SwapFormat(sc.format) && dev->presentPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
+        && res.swapStorageView != VK_NULL_HANDLE;
+    const bool usePresentUnorm =
+        isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
+        && res.swapStorageView != VK_NULL_HANDLE;
+
+    if (usePresentRgb10 || usePresentUnorm) {
+        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barriers[0].image = res.dstImage;
+
+        barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barriers[1].image = res.swapImage;
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                             0, nullptr, 2, barriers);
+
+        if (dev->presentParamsMapped) {
+            PresentParamsUBO presentParams{};
+            presentParams.extentWidth = sc.extent.width;
+            presentParams.extentHeight = sc.extent.height;
+            presentParams.rgb10PackMode = sc.presentRgb10PackMode;
+            presentParams.unormBgra = sc.presentUnormBgra ? 1u : 0u;
+            std::memcpy(dev->presentParamsMapped, &presentParams, sizeof(presentParams));
+        }
+
+        const uint32_t gx = (sc.extent.width + 15u) / 16u;
+        const uint32_t gy = (sc.extent.height + 15u) / 16u;
+        const VkPipeline presentPipe = usePresentRgb10 ? dev->presentPipeline : dev->presentUnormPipeline;
+        d.CmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, presentPipe);
+        d.CmdBindDescriptorSets(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->presentPipelineLayout, 0, 1, &res.presentSet,
+                                0, nullptr);
+        d.CmdDispatch(res.cmd, gx, gy, 1);
+
+        barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[0].dstAccessMask = 0;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[0].image = res.swapImage;
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, barriers);
+    } else {
+        d.CmdBlitImage(res.cmd, res.dstImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, res.swapImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[0].dstAccessMask = 0;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[0].image = res.swapImage;
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, barriers);
+    }
 
     d.EndCommandBuffer(res.cmd);
 
-    std::vector<VkPipelineStageFlags> waitStages(waitCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    std::vector<VkPipelineStageFlags> waitStages(waitCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = waitCount;
     submit.pWaitSemaphores = waitSemaphores;
@@ -1540,7 +1948,8 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     submit.pCommandBuffers = &res.cmd;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &res.doneSemaphore;
-    if (d.QueueSubmit(queue, 1, &submit, res.fence) != VK_SUCCESS) {
+    VkQueue submitQueue = dev->graphicsQueue != VK_NULL_HANDLE ? dev->graphicsQueue : queue;
+    if (d.QueueSubmit(submitQueue, 1, &submit, res.fence) != VK_SUCCESS) {
         return false;
     }
 

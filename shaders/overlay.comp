@@ -1,6 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
-// In-swapchain calibrator HUD: intensity + shape + color sliders.
+// In-swapchain calibrator HUD: intensity + shape + stretch + floor + color sliders.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std140, set = 0, binding = 0) uniform OverlayParams {
@@ -8,17 +9,20 @@ layout(std140, set = 0, binding = 0) uniform OverlayParams {
     float intensity;
     float colorIntensity;
     float expansionShape;
-    float focused;    // 0 = intensity, 1 = shape, 2 = color
+    float focused;    // 0 = intensity, 1 = shape, 2 = stretch, 3 = floor, 4 = color
     float outputMode; // 0=pq, 1=scrgb, 2=sdr
     float panelNits;
     float pointerValid;
     float pointerX;
     float pointerY;
-    float _pad0;
-    float _pad1;
+    float blackFloor;
+    float highlightStretch;
 };
 
 layout(set = 0, binding = 1, rgba16f) uniform image2D uImage;
+layout(set = 0, binding = 2) uniform sampler2D uFontAtlas;
+
+#include "overlay_font.glsl"
 
 vec3 linearToPq(vec3 x)
 {
@@ -44,140 +48,6 @@ vec3 encodeHud(vec3 linearRgb01, float nits)
     return linearRgb01;
 }
 
-uint digitBits(int d)
-{
-    const uint patterns[10] = uint[](
-        0x7B6Fu, // 0
-        0x2492u, // 1
-        0x73E7u, // 2
-        0x79E7u, // 3
-        0x5BE4u, // 4
-        0x79EFu, // 5
-        0x7BEFu, // 6
-        0x4927u, // 7
-        0x7BE7u, // 8
-        0x79E7u  // 9
-    );
-    return patterns[clamp(d, 0, 9)];
-}
-
-bool digitPixel(int d, int px, int py)
-{
-    if (px < 0 || px >= 3 || py < 0 || py >= 5) {
-        return false;
-    }
-    uint bits = digitBits(d);
-    uint bit = uint(py * 3 + px);
-    return ((bits >> bit) & 1u) != 0u;
-}
-
-bool drawValue(vec2 p, vec2 origin, float value)
-{
-    int hundredths = int(round(clamp(value, 0.0, 1.0) * 100.0));
-    int d0 = hundredths / 100;
-    int d1 = (hundredths / 10) % 10;
-    int d2 = hundredths % 10;
-    ivec2 ip = ivec2(floor(p - origin));
-    if (ip.y < 0 || ip.y >= 10) {
-        return false;
-    }
-    // "0.xx" layout: digit, dot, digit, digit — scaled 2x
-    int cell = ip.x / 8;
-    int lx = (ip.x % 8) / 2;
-    int ly = ip.y / 2;
-    if (cell == 0) {
-        return digitPixel(d0, lx, ly);
-    }
-    if (cell == 1) {
-        return (lx == 1 && ly == 4);
-    }
-    if (cell == 2) {
-        return digitPixel(d1, lx, ly);
-    }
-    if (cell == 3) {
-        return digitPixel(d2, lx, ly);
-    }
-    return false;
-}
-
-// Letter ids: A C E H I L N O P R S T Y
-uint letterBits(int id)
-{
-    const uint patterns[13] = uint[](
-        0x5BEAu, // A
-        0x724Fu, // C
-        0x73CFu, // E
-        0x5BE5u, // H
-        0x748Fu, // I
-        0x7241u, // L
-        0x5B59u, // N
-        0x7B6Fu, // O
-        0x13EFu, // P
-        0x57EFu, // R
-        0x79EFu, // S
-        0x2477u, // T
-        0x26ADu  // Y
-    );
-    return patterns[clamp(id, 0, 12)];
-}
-
-bool letterPixel(int id, int px, int py)
-{
-    if (px < 0 || px >= 3 || py < 0 || py >= 5) {
-        return false;
-    }
-    uint bits = letterBits(id);
-    uint bit = uint(py * 3 + px);
-    return ((bits >> bit) & 1u) != 0u;
-}
-
-int labelLetter(int row, int cell)
-{
-    // INTENSITY
-    const int intensityLetters[9] = int[](4, 6, 11, 2, 6, 10, 4, 11, 12);
-    // SHAPE
-    const int shapeLetters[5] = int[](10, 3, 0, 8, 2);
-    // COLOR
-    const int colorLetters[5] = int[](1, 7, 5, 7, 9);
-
-    if (row == 0) {
-        if (cell < 0 || cell >= 9) {
-            return -1;
-        }
-        return intensityLetters[cell];
-    }
-    if (row == 1) {
-        if (cell < 0 || cell >= 5) {
-            return -1;
-        }
-        return shapeLetters[cell];
-    }
-    if (cell < 0 || cell >= 5) {
-        return -1;
-    }
-    return colorLetters[cell];
-}
-
-bool drawLabel(vec2 p, vec2 origin, int row)
-{
-    ivec2 ip = ivec2(floor(p - origin));
-    if (ip.y < 0 || ip.y >= 10 || ip.x < 0) {
-        return false;
-    }
-    int cell = ip.x / 8;
-    int id = labelLetter(row, cell);
-    if (id < 0) {
-        return false;
-    }
-    int lx = (ip.x % 8) / 2;
-    int ly = ip.y / 2;
-    // 1px gap between glyphs (lx == 3 unused)
-    if (lx >= 3) {
-        return false;
-    }
-    return letterPixel(id, lx, ly);
-}
-
 void main()
 {
     uvec2 gid = gl_GlobalInvocationID.xy;
@@ -188,7 +58,7 @@ void main()
     float w = float(extent.x);
     float h = float(extent.y);
     float pw = min(520.0, w * 0.55);
-    float ph = 148.0;
+    float ph = 216.0;
     float x0 = (w - pw) * 0.5;
     float y0 = h - ph - 48.0;
     float x1 = x0 + pw;
@@ -206,12 +76,14 @@ void main()
         outRgb = mix(cur.rgb, bg, 0.78);
 
         float trackX0 = x0 + 140.0;
-        float trackX1 = x0 + pw - 70.0;
+        float trackX1 = x0 + pw - 16.0;
         float trackH = 14.0;
-        // Row order: Intensity, Shape, Color
+        // Row order: Intensity, Shape, Stretch, Floor, Color
         float intensityY = y0 + 34.0;
         float shapeY = y0 + 68.0;
-        float colorY = y0 + 102.0;
+        float stretchY = y0 + 102.0;
+        float floorY = y0 + 136.0;
+        float colorY = y0 + 170.0;
 
         if (p.y < y0 + 22.0) {
             outRgb = mix(outRgb, encodeHud(vec3(0.15, 0.35, 0.55), nits * 0.55), 0.85);
@@ -222,9 +94,11 @@ void main()
             outRgb = encodeHud(vec3(0.9, 0.7, 0.2), nits);
         }
 
-        for (int row = 0; row < 3; ++row) {
-            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : colorY);
-            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : colorIntensity);
+        const float labelScale = 1.0;
+
+        for (int row = 0; row < 5; ++row) {
+            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : ((row == 2) ? stretchY : ((row == 3) ? floorY : colorY)));
+            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : ((row == 2) ? highlightStretch : ((row == 3) ? blackFloor : colorIntensity)));
             bool focus = abs(focused - float(row)) < 0.5;
 
             if (p.x >= x0 + 12.0 && p.x <= x0 + 126.0 && p.y >= trackY - 2.0 && p.y <= trackY + trackH + 2.0) {
@@ -232,21 +106,19 @@ void main()
                 outRgb = mix(outRgb, encodeHud(lab, nits * 0.7), 0.55);
             }
 
-            if (drawLabel(p, vec2(x0 + 16.0, trackY - 1.0), row)) {
-                outRgb = encodeHud(vec3(0.08, 0.08, 0.10), nits);
+            float textAlpha = drawLabelRow(p, vec2(x0 + 16.0, trackY + 1.0), labelScale, row);
+            if (textAlpha > 0.01) {
+                vec3 textCol = focus ? vec3(0.08, 0.08, 0.10) : vec3(0.12, 0.12, 0.14);
+                outRgb = mix(outRgb, encodeHud(textCol, nits), clamp(textAlpha, 0.0, 1.0));
             }
 
             if (p.x >= trackX0 && p.x <= trackX1 && p.y >= trackY && p.y <= trackY + trackH) {
-                float t = clamp(value, 0.0, 1.0);
+                float t = (row == 2) ? clamp(value / 2.0, 0.0, 1.0) : clamp(value, 0.0, 1.0);
                 float fillX = mix(trackX0, trackX1, t);
                 vec3 trackBg = vec3(0.18, 0.20, 0.24);
                 vec3 fill = focus ? vec3(0.95, 0.75, 0.20) : vec3(0.35, 0.70, 0.95);
                 vec3 col = (p.x <= fillX) ? fill : trackBg;
                 outRgb = encodeHud(col, nits * 0.85);
-            }
-
-            if (drawValue(p, vec2(trackX1 + 10.0, trackY - 1.0), value)) {
-                outRgb = encodeHud(vec3(0.95, 0.95, 0.98), nits);
             }
         }
         wrote = true;

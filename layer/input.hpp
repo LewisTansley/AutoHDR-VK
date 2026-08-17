@@ -44,6 +44,10 @@ bool isShiftDown();
 bool isHDown();
 PointerState queryPointer(uint32_t extentW, uint32_t extentH);
 
+// Wayland: drive a virtual HUD cursor from relative-pointer while overlay is open
+// (locked/relative mouse games). No-op on X11-only paths.
+void setOverlayVirtualPointer(bool enabled, float seedX, float seedY);
+
 void initWaylandInput(wl_display *display);
 void unrefWaylandInput(wl_display *display);
 void registerWaylandSurface(void *vkSurface, wl_display *display);

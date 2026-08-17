@@ -33,6 +33,8 @@ int main(int argc, char **argv)
     std::cout << "reference_nits: " << settings.referenceNits << '\n';
     std::cout << "peak_nits:      " << settings.maxNits << '\n';
     std::cout << "black_point:    " << settings.blackPoint << '\n';
+    std::cout << "black_floor:    " << settings.blackFloor << '\n';
+    std::cout << "highlight_stretch:" << settings.highlightStretch << '\n';
     std::cout << "color_intensity:" << settings.colorIntensity << '\n';
     std::cout << "expansion_shape:" << settings.expansionShape << '\n';
     std::cout << "gamut_expansion:" << settings.gamutExpansion << '\n';

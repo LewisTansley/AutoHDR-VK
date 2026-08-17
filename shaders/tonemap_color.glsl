@@ -15,6 +15,52 @@ float applyUserBlackPoint(float t, float offset)
     return max(t - offset, 0.0) / max(1.0 - offset, 1e-6);
 }
 
+// Histogram highlight pre-stretch: pull the top tail toward 1.0 when content white is below peak.
+// User black-floor crush is handled separately via applyUserBlackPoint().
+float adaptContentRange(float yRel, float p05, float p25, float contentWhite, float geoMean, float stretchStrength)
+{
+    if (stretchStrength <= 1e-4) {
+        return clamp(yRel, 0.0, 1.0);
+    }
+
+    float yw = clamp(max(contentWhite, 1e-3), 1e-3, 1.0);
+    if (yw >= 0.98) {
+        return clamp(yRel, 0.0, 1.0);
+    }
+
+    // Strength scales with how far detected content white sits below reference peak.
+    float whiteExpand = (1.0 - smoothstep(0.55, 0.98, yw)) * stretchStrength;
+    float expandFactor = clamp(whiteExpand, 0.0, 1.0);
+
+    if (expandFactor < 1e-4) {
+        return clamp(yRel, 0.0, 1.0);
+    }
+
+    float yWhiteOut = mix(yw, 1.0, expandFactor);
+
+    // High knee for already-bright masters — only nudge the top tail.
+    float kneeMix = smoothstep(0.60, 0.95, yw);
+    float knee = mix(yw * 0.70, yw * 0.88, kneeMix);
+    float spanUpper = max(yw - knee, 1e-6);
+    float muted = 1.0 - smoothstep(0.55, 0.98, yw);
+    float maxGain = mix(1.25, 2.5, clamp(stretchStrength * 0.5, 0.0, 1.0));
+    maxGain = mix(maxGain, maxGain + 1.5, muted);
+    yWhiteOut = min(yWhiteOut, min(1.0, knee + spanUpper * maxGain));
+    yWhiteOut = max(yWhiteOut, yw);
+
+    if (yRel <= knee) {
+        return clamp(yRel, 0.0, 1.0);
+    }
+    if (yRel <= yw) {
+        float t = (yRel - knee) / spanUpper;
+        return mix(knee, yWhiteOut, clamp(t, 0.0, 1.0));
+    }
+
+    // Above content white: expand [yw, 1.0] -> [yWhiteOut, 1.0], never compress.
+    float t = clamp((yRel - yw) / max(1.0 - yw, 1e-3), 0.0, 1.0);
+    return max(mix(yWhiteOut, 1.0, t), yRel);
+}
+
 vec3 srgbToLinear(vec3 c)
 {
     bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
@@ -130,11 +176,11 @@ vec3 reconstructHighlights(vec3 rgbNits, float refNits)
 {
     vec3 rel = rgbNits / max(refNits, 1.0);
     float peak = max(max(rel.r, rel.g), rel.b);
-    if (peak <= 0.94) {
+    if (peak <= 0.90) {
         return rgbNits;
     }
     float minChannel = min(rel.r, min(rel.g, rel.b));
-    float nearClip = smoothstep(0.94, 0.99, peak);
+    float nearClip = smoothstep(0.90, 0.99, peak);
     float channelSpread = (peak - minChannel) / max(peak, 1e-4);
     float clipMask = nearClip * smoothstep(0.03, 0.08, channelSpread);
     if (clipMask <= 1e-4) {
@@ -192,16 +238,18 @@ vec3 expandGamutSmart(vec3 vHDRColor, float userBoost)
 
 float softHighlightShoulder(float luma, float displayPeak, float softness)
 {
-    if (softness <= 0.0 || luma <= displayPeak) {
+    if (softness <= 0.0) {
         return min(luma, displayPeak);
     }
-    float kneeStart = mix(displayPeak, displayPeak * 0.85, softness);
+    if (luma >= displayPeak) {
+        return displayPeak;
+    }
+    float kneeStart = mix(displayPeak, displayPeak * 0.92, softness);
     if (luma <= kneeStart) {
         return luma;
     }
-    float range = max(displayPeak - kneeStart, 1e-6);
-    float t = (luma - kneeStart) / range;
-    return kneeStart + range * (1.0 - exp(-t));
+    float t = (luma - kneeStart) / max(displayPeak - kneeStart, 1e-6);
+    return mix(kneeStart, displayPeak, 1.0 - pow(1.0 - clamp(t, 0.0, 1.0), 1.5));
 }
 
 float applyHighlightPeakLimit(float outLuma, float displayPeak, float softness)

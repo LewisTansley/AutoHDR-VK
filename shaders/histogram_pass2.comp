@@ -1,6 +1,6 @@
 #version 450
 
-// Single workgroup reduce: geo-mean, p10, p90, dynamic k1, intensity peak, GPU EMA (Plan 4).
+// Single workgroup reduce: geo-mean, p05 (p10 slot), p25 (k1 slot), p90, near-max white (p98), GPU EMA.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer GlobalHistogram {
@@ -9,11 +9,11 @@ layout(std430, set = 0, binding = 0) readonly buffer GlobalHistogram {
 
 layout(std430, set = 0, binding = 1) buffer SceneStatsRW {
     float geoMean;
-    float p10;
+    float p10; // p05 content-floor candidate for raised-floor detect
     float p90;
-    float k1;
+    float p98; // near-max content white (top bin with sufficient mass)
+    float k1;  // p25 bulk shadow for flatness detect
     float effectivePeak;
-    float exposure;
     float maxCLL;
     float maxFALL;
     uint initialized;
@@ -70,59 +70,87 @@ void main()
         float meanLog = logSum / float(max(count, 1u));
         float geo = exp2(meanLog);
 
-        uint target10 = max(totalPixels / 10u, 1u);
+        uint target05 = max(totalPixels / 20u, 1u);
+        uint target25 = max(totalPixels / 4u, 1u);
         uint target90 = (totalPixels * 9u) / 10u;
         uint cum = 0u;
-        float p10v = geo;
+        float p05v = geo;
+        float p25v = geo;
         float p90v = geo;
-        bool got10 = false;
+        bool got05 = false;
+        bool got25 = false;
+        bool got90 = false;
         for (uint i = 0u; i < 64u; ++i) {
             cum += binLocal[i];
             float u = (float(i) + 0.5) / 64.0;
             float y = exp2(u * 10.0 - 10.0);
-            if (!got10 && cum >= target10) {
-                p10v = y;
-                got10 = true;
+            if (!got05 && cum >= target05) {
+                p05v = y;
+                got05 = true;
             }
-            if (cum >= target90) {
+            if (!got25 && cum >= target25) {
+                p25v = y;
+                got25 = true;
+            }
+            if (!got90 && cum >= target90) {
                 p90v = y;
+                got90 = true;
                 break;
             }
         }
 
-        float k1Raw = mix(0.70, 0.90, smoothstep(0.08, 0.55, p90v));
-        // Full panel peak for the HDR look; intensity is applied only as post-map mix in tonemap.
+        // Near-max content white: highest bin with enough mass (~top 0.0125%),
+        // so sparse doorway/speculars define white instead of wall mass.
+        uint minMass = max(totalPixels / 8000u, 1u);
+        float yMaxv = p90v;
+        for (int i = 63; i >= 0; --i) {
+            if (binLocal[i] >= minMass) {
+                float u = (float(i) + 0.5) / 64.0;
+                yMaxv = exp2(u * 10.0 - 10.0);
+                break;
+            }
+        }
+        // If the mass bar still missed sparse tops, accept any occupied bin above p90.
+        if (yMaxv <= p90v + 1e-6) {
+            for (int i = 63; i >= 0; --i) {
+                if (binLocal[i] >= 1u) {
+                    float u = (float(i) + 0.5) / 64.0;
+                    float y = exp2(u * 10.0 - 10.0);
+                    if (y > yMaxv) {
+                        yMaxv = y;
+                    }
+                    break;
+                }
+            }
+        }
+        yMaxv = max(yMaxv, p90v);
+
+        // User-configured peak; intensity is applied only as post-map mix in tonemap.
         float maxEffectPeak = max(peakNits, max(referenceNits, sdrWhiteNits));
-        // Inverse ABL: pull peak down when the frame is mid/bright on average or has large highlight mass.
-        // Dark rooms keep more headroom for sparse speculars only.
-        float brightMass = smoothstep(0.06, 0.28, geo);
-        float highlightFlood = smoothstep(0.15, 0.42, p90v);
-        float abl = mix(1.0, 0.22, max(brightMass, highlightFlood * 0.95));
-        // Extra restraint when geo-mean is elevated (lobby/UI-heavy / bright scenes).
-        abl *= mix(1.0, 0.45, smoothstep(0.08, 0.30, geo));
-        // Title/flood frames: hug reference white so max intensity cannot wash the frame.
-        abl *= mix(1.0, 0.40, highlightFlood * brightMass);
-        float peakRaw = max(maxEffectPeak * abl, max(referenceNits, sdrWhiteNits));
-        // Keep exposure at 1; BT.2446 uses k1 + effectivePeak only (no overall gain lift).
-        float exposureRaw = 1.0;
+        float peakRaw = maxEffectPeak;
 
         float geoOut = geo;
-        float k1Out = k1Raw;
+        float p05Out = p05v;
+        float p25Out = p25v;
+        float p90Out = p90v;
+        float yMaxOut = yMaxv;
         float peakOut = peakRaw;
         if (temporalEnable > 0.5 && initialized != 0u) {
             geoOut = ema(geoMean, geo, geo > geoMean);
-            k1Out = ema(k1, k1Raw, k1Raw > k1);
-            peakOut = ema(effectivePeak, peakRaw, peakRaw > effectivePeak);
+            p05Out = ema(p10, p05v, p05v > p10);
+            p25Out = ema(k1, p25v, p25v > k1);
+            p90Out = ema(p90, p90v, p90v > p90);
+            yMaxOut = ema(p98, yMaxv, yMaxv > p98);
         }
 
         geoMean = geoOut;
-        p10 = p10v;
-        p90 = p90v;
-        k1 = k1Out;
+        p10 = p05Out;
+        p90 = p90Out;
+        p98 = yMaxOut;
+        k1 = p25Out;
         effectivePeak = peakOut;
-        exposure = exposureRaw;
         maxFALL = geoOut * referenceNits;
-        maxCLL = p90v * peakOut;
+        maxCLL = yMaxOut * peakOut;
         initialized = 1u;
     }
 }

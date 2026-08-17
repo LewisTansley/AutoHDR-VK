@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 3) uniform ToneParams {
     float outputMode; // 0=pq, 1=scrgb, 2=sdr preview
     float inputIsSrgb;
     float intensity;
+    float highlightStretch;
     float ditherStrength; // 0 = off, 1 = one LSB
     vec4 pqBoostParams;
     uvec2 extent;
@@ -33,9 +34,9 @@ layout(std430, set = 0, binding = 5) readonly buffer SceneStatsBlock {
     float geoMean;
     float p10;
     float p90;
+    float p98;
     float k1;
     float effectivePeak;
-    float exposure;
     float maxCLL;
     float maxFALL;
     uint initialized;
@@ -79,7 +80,12 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
     rgbNits = reconstructHighlights(rgbNits, ref);
 
     float rawLumaNits = max(luminanceYNits(rgbNits), 1e-6);
-    float curveInputNits = applyUserBlackPoint(rawLumaNits / ref, blackPoint) * ref;
+    float yRel = rawLumaNits / ref;
+    if (sceneStats.initialized != 0u) {
+        yRel = adaptContentRange(yRel, sceneStats.p10, sceneStats.k1, sceneStats.p98, sceneStats.geoMean,
+                                 highlightStretch);
+    }
+    float curveInputNits = applyUserBlackPoint(yRel, blackPoint) * ref;
     float outputNits = mapToneCurve(curveInputNits, curveSpan);
 
     // Color slider gates gamut expand: 0 = none, 1 = full gamut_expansion max.
@@ -126,12 +132,8 @@ void main()
     float ref = max(referenceNits, 1.0);
     float t = clamp(intensity, 0.0, 1.0);
 
-    // Peak from hist ABL when available — intensity does NOT shrink the curve target
-    // (avoids mid-slider dead zone). Strength is the post-map mix only.
+    // User-configured peak; intensity is the post-map mix only.
     float displayPeak = max(peakNits, ref);
-    if (sceneStats.initialized != 0u) {
-        displayPeak = clamp(sceneStats.effectivePeak, ref, max(peakNits, ref));
-    }
 
     float curveSpan = toneCurveInputSpan > 1.0 ? toneCurveInputSpan : ref;
     vec3 sdrNits = rgb * ref;

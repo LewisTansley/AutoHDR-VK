@@ -1,0 +1,35 @@
+#version 450
+
+// Resolve fp16 compute output into 8-bit UNORM swap-format storage (via R32_UINT view).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uInput;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D uOutput;
+
+layout(std140, set = 0, binding = 2) uniform PresentParams {
+    uvec2 extent;
+    uint rgb10PackMode;
+    uint unormBgra; // 0 = RGBA byte order, 1 = BGRA byte order
+};
+
+uint packRgba8(vec4 c, bool bgra)
+{
+    uvec4 u = uvec4(round(clamp(c, 0.0, 1.0) * 255.0));
+    if (bgra) {
+        return u.b | (u.g << 8u) | (u.r << 16u) | (u.a << 24u);
+    }
+    return u.r | (u.g << 8u) | (u.b << 16u) | (u.a << 24u);
+}
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= extent.x || gid.y >= extent.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(extent);
+    vec4 c = texture(uInput, uv);
+    uint packed = packRgba8(c, unormBgra > 0u);
+    imageStore(uOutput, ivec2(gid), uvec4(packed, 0u, 0u, 0u));
+}
