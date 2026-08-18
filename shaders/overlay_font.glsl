@@ -84,10 +84,19 @@ float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
         alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
         return alpha;
     }
-    alpha = max(alpha, drawGlyph(p, cursor, scale, 67)); // C
+    if (row == 4) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 67)); // C
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 76)); // L
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
+        return alpha;
+    }
+    alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S
+    alpha = max(alpha, drawGlyph(p, cursor, scale, 77)); // M
     alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
-    alpha = max(alpha, drawGlyph(p, cursor, scale, 76)); // L
     alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
-    alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
+    alpha = max(alpha, drawGlyph(p, cursor, scale, 84)); // T
+    alpha = max(alpha, drawGlyph(p, cursor, scale, 72)); // H
     return alpha;
 }

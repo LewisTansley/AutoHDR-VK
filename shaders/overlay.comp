@@ -17,6 +17,7 @@ layout(std140, set = 0, binding = 0) uniform OverlayParams {
     float pointerY;
     float blackFloor;
     float highlightStretch;
+    float debandStrength;
 };
 
 layout(set = 0, binding = 1, rgba16f) uniform image2D uImage;
@@ -58,7 +59,7 @@ void main()
     float w = float(extent.x);
     float h = float(extent.y);
     float pw = min(520.0, w * 0.55);
-    float ph = 216.0;
+    float ph = 250.0;
     float x0 = (w - pw) * 0.5;
     float y0 = h - ph - 48.0;
     float x1 = x0 + pw;
@@ -78,12 +79,13 @@ void main()
         float trackX0 = x0 + 140.0;
         float trackX1 = x0 + pw - 16.0;
         float trackH = 14.0;
-        // Row order: Intensity, Shape, Stretch, Floor, Color
+        // Row order: Intensity, Shape, Stretch, Floor, Color, Smooth
         float intensityY = y0 + 34.0;
         float shapeY = y0 + 68.0;
         float stretchY = y0 + 102.0;
         float floorY = y0 + 136.0;
         float colorY = y0 + 170.0;
+        float smoothY = y0 + 204.0;
 
         if (p.y < y0 + 22.0) {
             outRgb = mix(outRgb, encodeHud(vec3(0.15, 0.35, 0.55), nits * 0.55), 0.85);
@@ -96,9 +98,9 @@ void main()
 
         const float labelScale = 1.0;
 
-        for (int row = 0; row < 5; ++row) {
-            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : ((row == 2) ? stretchY : ((row == 3) ? floorY : colorY)));
-            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : ((row == 2) ? highlightStretch : ((row == 3) ? blackFloor : colorIntensity)));
+        for (int row = 0; row < 6; ++row) {
+            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : ((row == 2) ? stretchY : ((row == 3) ? floorY : ((row == 4) ? colorY : smoothY))));
+            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : ((row == 2) ? highlightStretch : ((row == 3) ? blackFloor : ((row == 4) ? colorIntensity : clamp(debandStrength, 0.0, 1.0)))));
             bool focus = abs(focused - float(row)) < 0.5;
 
             if (p.x >= x0 + 12.0 && p.x <= x0 + 126.0 && p.y >= trackY - 2.0 && p.y <= trackY + trackH + 2.0) {
@@ -114,6 +116,9 @@ void main()
 
             if (p.x >= trackX0 && p.x <= trackX1 && p.y >= trackY && p.y <= trackY + trackH) {
                 float t = (row == 2) ? clamp(value / 2.0, 0.0, 1.0) : clamp(value, 0.0, 1.0);
+                if (row == 5) {
+                    t = clamp(debandStrength, 0.0, 1.0);
+                }
                 float fillX = mix(trackX0, trackX1, t);
                 vec3 trackBg = vec3(0.18, 0.20, 0.24);
                 vec3 fill = focus ? vec3(0.95, 0.75, 0.20) : vec3(0.35, 0.70, 0.95);

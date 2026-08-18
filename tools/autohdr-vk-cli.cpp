@@ -40,6 +40,7 @@ int main(int argc, char **argv)
     std::cout << "gamut_expansion:" << settings.gamutExpansion << '\n';
     std::cout << "dither:         " << (settings.dither ? "yes" : "no") << '\n';
     std::cout << "dither_strength:" << settings.ditherStrength << '\n';
+    std::cout << "deband_strength:" << settings.debandStrength << '\n';
     std::cout << "tone_curve:     " << AutoHdr::presetToString(settings.toneCurvePreset) << '\n';
     std::cout << "curve_points:   " << AutoHdr::formatToneCurvePoints(settings.toneCurvePoints) << '\n';
     std::cout << "sdr_max_point:  " << AutoHdr::formatSdrMaxPoint(settings.sdrMaxPoint) << '\n';

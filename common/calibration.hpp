@@ -20,7 +20,8 @@ struct CalibrationSettings {
     float highlightStretch = 0.45f; // histogram highlight pre-stretch (0 = off, 1 = legacy max, 2 = aggressive)
     float expansionShape = 0.55f; // 0 = linear, 1 = exponential (darker mids)
     bool dither = true;
-    float ditherStrength = 1.0f; // 1 = one LSB of output bit depth
+    float ditherStrength = 1.25f; // auto present-pass dither strength
+    float debandStrength = 0.7f;  // SMOOTH slider: mpv-style spatial deband (0–1)
     bool perceptualColor = true;
     Vec2 sdrMaxPoint{203.0f, 1000.0f};
     std::vector<Vec2> toneCurvePoints;
@@ -139,6 +140,17 @@ inline float clampDitherStrength(float value)
     }
     if (value > 2.0f) {
         return 2.0f;
+    }
+    return value;
+}
+
+inline float clampDebandStrength(float value)
+{
+    if (value < 0.0f) {
+        return 0.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
     }
     return value;
 }

@@ -9,6 +9,7 @@
 #include "histogram_pass2.comp.spv.h"
 #include "overlay.comp.spv.h"
 #include "overlay_font_atlas.h"
+#include "blue_noise_atlas.h"
 #include "present_rgb10.comp.spv.h"
 #include "present_unorm.comp.spv.h"
 #include "tonemap.comp.spv.h"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace AutoHdrVk {
 
@@ -296,6 +298,41 @@ bool uploadOverlayFontAtlas(DeviceData *dev)
                                          dev->overlayFontMemory, dev->overlayFontView, dev->overlayFontLayout);
 }
 
+bool uploadBlueNoiseAtlas(DeviceData *dev)
+{
+    if (dev->blueNoiseView != VK_NULL_HANDLE) {
+        dev->blueNoiseReady = true;
+        return true;
+    }
+    if (dev->graphicsQueue == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(kBlueNoiseAtlasWidth) * static_cast<size_t>(kBlueNoiseAtlasHeight);
+    std::vector<uint8_t> rgba(pixelCount * 4);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const uint8_t v = kBlueNoiseAtlasR8[i];
+        rgba[i * 4 + 0] = v;
+        rgba[i * 4 + 1] = v;
+        rgba[i * 4 + 2] = v;
+        rgba[i * 4 + 3] = 255;
+    }
+
+    const VkExtent2D extent{kBlueNoiseAtlasWidth, kBlueNoiseAtlasHeight};
+    const VkDeviceSize rowBytes = static_cast<VkDeviceSize>(extent.width * 4u);
+    const bool atlasOk = uploadOptimalSampledRgbaImage(dev, extent, rgba.data(), rowBytes, dev->blueNoiseImage,
+                                                      dev->blueNoiseMemory, dev->blueNoiseView, dev->blueNoiseLayout);
+    if (!atlasOk) {
+        logf("blue-noise atlas upload failed; present dither falls back to IGN");
+        static const uint8_t kFallbackPixel[4] = {128, 128, 128, 255};
+        const VkExtent2D fallbackExtent{1, 1};
+        uploadOptimalSampledRgbaImage(dev, fallbackExtent, kFallbackPixel, 4, dev->blueNoiseImage, dev->blueNoiseMemory,
+                                      dev->blueNoiseView, dev->blueNoiseLayout);
+    }
+    dev->blueNoiseReady = atlasOk;
+    return dev->blueNoiseView != VK_NULL_HANDLE;
+}
+
 bool isRgb10SwapFormat(VkFormat format)
 {
     return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
@@ -315,6 +352,23 @@ uint32_t rgb10PackModeForFormat(VkFormat format)
 bool unormBgraForFormat(VkFormat format)
 {
     return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+uint32_t outputBitsForSwapFormat(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
+        return 10;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+        return 16;
+    default:
+        return 8;
+    }
 }
 
 bool createComputePipeline(DeviceData *dev, const uint32_t *spv, size_t spvSize, VkPipelineLayout layout,
@@ -383,8 +437,34 @@ uint32_t findMemoryType(DeviceData *dev, uint32_t typeBits, VkMemoryPropertyFlag
     return UINT32_MAX;
 }
 
+bool canUsePresentCompute(const DeviceData *dev, const SwapchainData &sc, const SwapchainImageResources &res)
+{
+    const bool usePresentRgb10 = isRgb10SwapFormat(sc.format) && dev->presentPipeline != VK_NULL_HANDLE
+        && res.presentSet != VK_NULL_HANDLE && res.swapStorageView != VK_NULL_HANDLE;
+    const bool usePresentUnorm = isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE
+        && res.presentSet != VK_NULL_HANDLE && res.swapStorageView != VK_NULL_HANDLE;
+    return usePresentRgb10 || usePresentUnorm;
+}
+
+const char *presentPathLabel(const DeviceData *dev, const SwapchainData &sc, const SwapchainImageResources &res)
+{
+    if (isRgb10SwapFormat(sc.format) && dev->presentPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
+        && res.swapStorageView != VK_NULL_HANDLE) {
+        return "rgb10";
+    }
+    if (isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
+        && res.swapStorageView != VK_NULL_HANDLE) {
+        return "unorm8";
+    }
+    if (res.swapStorageView == VK_NULL_HANDLE) {
+        return "blit(no_storage_view)";
+    }
+    return "blit";
+}
+
 void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat)
+                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat,
+                      bool presentUsesCompute)
 {
     if (!dev->uboMapped || !dev->lutMapped) {
         return;
@@ -408,29 +488,13 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     const float span = std::max(endpoints.sdrMaxPoint.x, settings.referenceNits);
     float lut[AutoHdr::kToneCurveLutSize];
     AutoHdr::buildToneCurveLut(full, span, lut, AutoHdr::kToneCurveLutSize);
-    float packed[256 * 4];
+    float packed[AutoHdr::kToneCurveLutSize];
     for (int i = 0; i < AutoHdr::kToneCurveLutSize; ++i) {
         packed[i] = lut[i];
     }
     std::memcpy(dev->lutMapped, packed, sizeof(packed));
 
-    uint32_t outputBits = 8;
-    switch (swapFormat) {
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
-    case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
-        outputBits = 10;
-        break;
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-    case VK_FORMAT_R16G16B16A16_UNORM:
-    case VK_FORMAT_R16G16B16A16_SNORM:
-        outputBits = 16;
-        break;
-    default:
-        outputBits = 8;
-        break;
-    }
+    uint32_t outputBits = outputBitsForSwapFormat(swapFormat);
 
     ToneParamsUBO ubo{};
     ubo.blackPoint = AutoHdr::blackFloorToBlackPoint(settings.blackFloor);
@@ -445,7 +509,7 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
     ubo.intensity = intensity;
     ubo.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
-    ubo.ditherStrength = settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
+    ubo.debandStrength = AutoHdr::clampDebandStrength(settings.debandStrength);
     switch (encoding) {
     case OutputEncoding::LinearScRgb:
         ubo.outputMode = 1.0f;
@@ -465,6 +529,7 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.extentWidth = extent.width;
     ubo.extentHeight = extent.height;
     ubo.outputBits = outputBits;
+    ubo.presentUsesCompute = presentUsesCompute ? 1u : 0u;
     std::memcpy(dev->uboMapped, &ubo, sizeof(ubo));
 
     if (dev->histParamsMapped) {
@@ -732,6 +797,20 @@ void destroyDeviceResources(DeviceData *dev)
         dev->overlayFontMemory = VK_NULL_HANDLE;
     }
     dev->overlayFontLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dev->blueNoiseView) {
+        d.DestroyImageView(dev->device, dev->blueNoiseView, nullptr);
+        dev->blueNoiseView = VK_NULL_HANDLE;
+    }
+    if (dev->blueNoiseImage) {
+        d.DestroyImage(dev->device, dev->blueNoiseImage, nullptr);
+        dev->blueNoiseImage = VK_NULL_HANDLE;
+    }
+    if (dev->blueNoiseMemory) {
+        d.FreeMemory(dev->device, dev->blueNoiseMemory, nullptr);
+        dev->blueNoiseMemory = VK_NULL_HANDLE;
+    }
+    dev->blueNoiseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    dev->blueNoiseReady = false;
     if (dev->commandPool) {
         d.DestroyCommandPool(dev->device, dev->commandPool, nullptr);
         dev->commandPool = VK_NULL_HANDLE;
@@ -779,8 +858,8 @@ bool ensureDeviceResources(DeviceData *dev)
                           dev->uboMemory, &dev->uboMapped)) {
         return false;
     }
-    if (!createHostBuffer(dev, sizeof(float) * 4 * 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->lutBuffer,
-                          dev->lutMemory, &dev->lutMapped)) {
+    if (!createHostBuffer(dev, sizeof(float) * AutoHdr::kToneCurveLutSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                          dev->lutBuffer, dev->lutMemory, &dev->lutMapped)) {
         return false;
     }
     if (!createHostBuffer(dev, sizeof(HistParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->histParamsBuffer,
@@ -960,7 +1039,7 @@ bool ensureDeviceResources(DeviceData *dev)
     }
 
     {
-        VkDescriptorSetLayoutBinding bindings[3]{};
+        VkDescriptorSetLayoutBinding bindings[4]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[0].descriptorCount = 1;
@@ -973,9 +1052,13 @@ bool ensureDeviceResources(DeviceData *dev)
         bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[3].binding = 3;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[3].descriptorCount = 1;
+        bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layoutInfo.bindingCount = 3;
+        layoutInfo.bindingCount = 4;
         layoutInfo.pBindings = bindings;
         if (d.CreateDescriptorSetLayout(dev->device, &layoutInfo, nullptr, &dev->presentSetLayout) != VK_SUCCESS) {
             return false;
@@ -1076,6 +1159,7 @@ bool ensureDeviceResources(DeviceData *dev)
     if (!uploadOverlayFontAtlas(dev)) {
         logf("overlay font unavailable; labels may be missing");
     }
+    uploadBlueNoiseAtlas(dev);
 
     VkDescriptorPoolSize sizes[4]{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1313,7 +1397,7 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
 
         VkDescriptorBufferInfo lutInfo{};
         lutInfo.buffer = dev->lutBuffer;
-        lutInfo.range = sizeof(float) * 4 * 256;
+        lutInfo.range = sizeof(float) * AutoHdr::kToneCurveLutSize;
 
         VkDescriptorImageInfo storageInfo{};
         storageInfo.imageView = res.dstView;
@@ -1523,7 +1607,7 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
             presentOutputInfo.imageView = res.swapStorageView;
             presentOutputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            VkWriteDescriptorSet presentWrites[3]{};
+            VkWriteDescriptorSet presentWrites[4]{};
             presentWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             presentWrites[0].dstSet = res.presentSet;
             presentWrites[0].dstBinding = 0;
@@ -1542,7 +1626,22 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
             presentWrites[2].descriptorCount = 1;
             presentWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             presentWrites[2].pBufferInfo = &presentParamsInfo;
-            d.UpdateDescriptorSets(dev->device, 3, presentWrites, 0, nullptr);
+
+            uint32_t presentWriteCount = 3;
+            VkDescriptorImageInfo blueNoiseInfo{};
+            if (dev->blueNoiseView != VK_NULL_HANDLE && dev->sampler != VK_NULL_HANDLE) {
+                blueNoiseInfo.sampler = dev->sampler;
+                blueNoiseInfo.imageView = dev->blueNoiseView;
+                blueNoiseInfo.imageLayout = dev->blueNoiseLayout;
+                presentWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                presentWrites[3].dstSet = res.presentSet;
+                presentWrites[3].dstBinding = 3;
+                presentWrites[3].descriptorCount = 1;
+                presentWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                presentWrites[3].pImageInfo = &blueNoiseInfo;
+                presentWriteCount = 4;
+            }
+            d.UpdateDescriptorSets(dev->device, presentWriteCount, presentWrites, 0, nullptr);
         }
 
         VkCommandBufferAllocateInfo cmdAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1612,7 +1711,20 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     }
 
     if (effectOn) {
-        uploadToneParams(dev, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent, sc.format);
+        const bool usePresentCompute = canUsePresentCompute(dev, sc, res);
+        uploadToneParams(dev, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent, sc.format,
+                         usePresentCompute);
+
+        if (!sc.presentPathLogged) {
+            const char *path = presentPathLabel(dev, sc, res);
+            const float ditherStrength =
+                settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
+            logf("present path=%s format=%u outputBits=%u dither=%.2f deband=%.2f blueNoise=%u storageView=%u",
+                 path, static_cast<unsigned>(sc.format), outputBitsForSwapFormat(sc.format), ditherStrength,
+                 AutoHdr::clampDebandStrength(settings.debandStrength), dev->blueNoiseReady ? 1u : 0u,
+                 res.swapStorageView != VK_NULL_HANDLE ? 1u : 0u);
+            sc.presentPathLogged = true;
+        }
     }
     if (drawOverlay) {
         OverlayParamsUBO overlayUbo{};
@@ -1630,6 +1742,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         overlayUbo.pointerY = hud.pointerY;
         overlayUbo.blackFloor = hud.blackFloor;
         overlayUbo.highlightStretch = hud.highlightStretch;
+        overlayUbo.debandStrength = hud.debandStrength;
         uploadOverlayParams(dev, overlayUbo);
     }
 
@@ -1884,8 +1997,9 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     const bool usePresentUnorm =
         isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
         && res.swapStorageView != VK_NULL_HANDLE;
+    const bool usePresentCompute = usePresentRgb10 || usePresentUnorm;
 
-    if (usePresentRgb10 || usePresentUnorm) {
+    if (usePresentCompute) {
         barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1906,6 +2020,11 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
             presentParams.extentHeight = sc.extent.height;
             presentParams.rgb10PackMode = sc.presentRgb10PackMode;
             presentParams.unormBgra = sc.presentUnormBgra ? 1u : 0u;
+            presentParams.outputBits = outputBitsForSwapFormat(sc.format);
+            presentParams.outputMode = static_cast<uint32_t>(outputMode);
+            presentParams.ditherStrength =
+                settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
+            presentParams.useBlueNoise = dev->blueNoiseReady ? 1.0f : 0.0f;
             std::memcpy(dev->presentParamsMapped, &presentParams, sizeof(presentParams));
         }
 

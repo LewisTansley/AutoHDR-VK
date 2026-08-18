@@ -132,13 +132,13 @@ struct ToneParamsUBO {
     float inputIsSrgb = 1.0f;
     float intensity = 0.5f;
     float highlightStretch = 0.45f;
-    float ditherStrength = 1.0f;
+    float debandStrength = 0.7f;
     float _padTone[3] = {0.0f, 0.0f, 0.0f}; // std140: pad 48→64 before vec4
     float pqBoostParams[4] = {10000.0f, 10000.0f, 1.0f, 0.0f};
     uint32_t extentWidth = 0;
     uint32_t extentHeight = 0;
     uint32_t outputBits = 10;
-    uint32_t _padBits = 0;
+    uint32_t presentUsesCompute = 1;
 };
 static_assert(sizeof(ToneParamsUBO) == 96, "ToneParamsUBO must match std140 tonemap.comp ToneParams");
 static_assert(offsetof(ToneParamsUBO, extentWidth) == 80, "ToneParamsUBO extent must be at std140 offset 80");
@@ -158,6 +158,7 @@ struct OverlayParamsUBO {
     float pointerY = 0.0f;
     float blackFloor = 0.0f;
     float highlightStretch = 0.45f;
+    float debandStrength = 0.7f;
 };
 
 struct HistParamsUBO {
@@ -216,8 +217,16 @@ struct PresentParamsUBO {
     uint32_t extentHeight = 0;
     uint32_t rgb10PackMode = 0; // 0 = A2B10G10R10, 1 = A2R10G10B10
     uint32_t unormBgra = 0;     // 0 = RGBA, 1 = BGRA (8-bit present)
+    uint32_t outputBits = 10;
+    uint32_t outputMode = 0; // 0=pq, 1=scrgb, 2=sdr
+    float ditherStrength = 0.0f;
+    float useBlueNoise = 1.0f;
+    float _pad0 = 0.0f;
+    float _pad1 = 0.0f;
+    float _pad2 = 0.0f;
+    float _pad3 = 0.0f;
 };
-static_assert(sizeof(PresentParamsUBO) == 16, "PresentParamsUBO must match std140 present shaders");
+static_assert(sizeof(PresentParamsUBO) == 48, "PresentParamsUBO must match std140 present shaders");
 
 struct SwapchainImageResources {
     VkImage swapImage = VK_NULL_HANDLE;
@@ -262,6 +271,7 @@ struct SwapchainData {
     OutputEncoding encoding = OutputEncoding::SdrPreview;
     uint32_t presentRgb10PackMode = 0;
     bool presentUnormBgra = false;
+    bool presentPathLogged = false;
 
     VkBuffer histBuffer = VK_NULL_HANDLE;
     VkDeviceMemory histMemory = VK_NULL_HANDLE;
@@ -351,6 +361,12 @@ struct DeviceData {
     VkImageView overlayFontView = VK_NULL_HANDLE;
     VkImageLayout overlayFontLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
+    VkImage blueNoiseImage = VK_NULL_HANDLE;
+    VkDeviceMemory blueNoiseMemory = VK_NULL_HANDLE;
+    VkImageView blueNoiseView = VK_NULL_HANDLE;
+    VkImageLayout blueNoiseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool blueNoiseReady = false;
+
     bool pipelineReady = false;
     bool hdrMetadataExt = false;
 
@@ -381,7 +397,8 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
                     uint32_t waitCount, const VkSemaphore *waitSemaphores, VkSemaphore &outSignal,
                     bool effectOn, bool drawOverlay);
 void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat);
+                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat,
+                      bool presentUsesCompute);
 void uploadOverlayParams(DeviceData *dev, const OverlayParamsUBO &params);
 
 } // namespace AutoHdrVk

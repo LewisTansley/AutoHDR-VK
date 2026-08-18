@@ -13,6 +13,20 @@ set(SHADER_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${SHADER_GEN_DIR})
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/implicit_layer.d)
 
+set(BLUE_NOISE_ATLAS_H ${SHADER_GEN_DIR}/blue_noise_atlas.h)
+
+add_executable(bake_blue_noise tools/bake_blue_noise.cpp)
+
+add_custom_command(
+    OUTPUT ${BLUE_NOISE_ATLAS_H}
+    COMMAND bake_blue_noise ${BLUE_NOISE_ATLAS_H}
+    DEPENDS bake_blue_noise
+    COMMENT "Baking blue-noise atlas"
+    VERBATIM
+)
+
+add_custom_target(blue_noise_assets DEPENDS ${BLUE_NOISE_ATLAS_H})
+
 set(OVERLAY_FONT_ATLAS_H ${SHADER_GEN_DIR}/overlay_font_atlas.h)
 set(OVERLAY_FONT_METRICS_GLSL ${SHADER_GEN_DIR}/overlay_font_metrics.glsl)
 
@@ -61,14 +75,14 @@ function(compile_shader NAME VAR_NAME)
     set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
 endfunction()
 
-compile_shader(tonemap.comp tonemap_comp_spv)
+compile_shader(tonemap.comp tonemap_comp_spv ${SHADER_DIR}/deband.glsl ${SHADER_DIR}/tonemap_dither.glsl)
 compile_shader(histogram_pass1.comp histogram_pass1_comp_spv)
 compile_shader(histogram_pass2.comp histogram_pass2_comp_spv)
 compile_shader(ui_cluster.comp ui_cluster_comp_spv)
 compile_shader(base_blur.comp base_blur_comp_spv)
 compile_shader(overlay.comp overlay_comp_spv ${SHADER_DIR}/overlay_font.glsl ${OVERLAY_FONT_METRICS_GLSL})
-compile_shader(present_rgb10.comp present_rgb10_comp_spv)
-compile_shader(present_unorm.comp present_unorm_comp_spv)
+compile_shader(present_rgb10.comp present_rgb10_comp_spv ${SHADER_DIR}/dither.glsl)
+compile_shader(present_unorm.comp present_unorm_comp_spv ${SHADER_DIR}/dither.glsl)
 
 add_library(VkLayer_AUTOHDR_tonemap SHARED
     layer/entry.cpp
@@ -82,9 +96,10 @@ add_library(VkLayer_AUTOHDR_tonemap SHARED
     common/tone_curve_presets.cpp
     ${SHADER_HEADERS}
     ${OVERLAY_FONT_ATLAS_H}
+    ${BLUE_NOISE_ATLAS_H}
 )
 
-add_dependencies(VkLayer_AUTOHDR_tonemap overlay_font_assets)
+add_dependencies(VkLayer_AUTOHDR_tonemap overlay_font_assets blue_noise_assets)
 
 find_package(X11 REQUIRED)
 find_package(PkgConfig REQUIRED)

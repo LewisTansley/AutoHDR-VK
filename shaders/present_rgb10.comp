@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Resolve fp16 compute output into A2B10G10R10 / A2R10G10B10 swap-format storage.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -10,7 +11,17 @@ layout(std140, set = 0, binding = 2) uniform PresentParams {
     uvec2 extent;
     uint rgb10PackMode; // 0 = A2B10G10R10, 1 = A2R10G10B10
     uint unormBgra;
+    uint outputBits;
+    uint outputMode; // 0=pq, 1=scrgb, 2=sdr
+    float ditherStrength;
+    float useBlueNoise;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+    float _pad3;
 };
+
+#include "dither.glsl"
 
 uint packA2B10G10R10(vec4 c)
 {
@@ -32,7 +43,9 @@ void main()
     }
 
     vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(extent);
-    vec4 c = texture(uInput, uv);
+    vec3 rgb = texture(uInput, uv).rgb;
+    rgb = applyPresentDither(rgb, gid, ditherStrength, outputBits, outputMode, useBlueNoise);
+    vec4 c = vec4(rgb, 1.0);
     uint packed = rgb10PackMode > 0u ? packA2R10G10B10(c) : packA2B10G10R10(c);
     imageStore(uOutput, ivec2(gid), uvec4(packed, 0u, 0u, 0u));
 }

@@ -44,7 +44,7 @@ OutputEncoding activeEncoding();
 bool wantHdrMetadata();
 bool wantPreferHdrSwapchain();
 bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float blackFloor,
-                         float highlightStretch);
+                         float highlightStretch, float debandStrength);
 
 std::string currentExecutableName();
 

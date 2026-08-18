@@ -12,6 +12,7 @@ enum class FocusedSlider : int {
     HighlightStretch = 2,
     BlackFloor = 3,
     ColorIntensity = 4,
+    DitherStrength = 5, // SMOOTH: mpv-style deband (0–1)
 };
 
 struct OverlayDrawState {
@@ -21,6 +22,7 @@ struct OverlayDrawState {
     float expansionShape = 0.55f;
     float blackFloor = 0.0f;
     float highlightStretch = 0.45f;
+    float debandStrength = 0.7f;
     int focused = 0;
     float panelNits = 203.0f;
     float outputMode = 0.0f; // 0=pq, 1=scrgb, 2=sdr

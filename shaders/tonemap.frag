@@ -7,7 +7,7 @@ layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform sampler2D uInput;
 
 layout(std140, set = 0, binding = 1) uniform ToneLut {
-    vec4 toneCurveLutPacked[256]; // 1024 floats
+    vec4 toneCurveLutPacked[1024]; // 4096 floats
 };
 
 layout(std140, set = 0, binding = 2) uniform ToneParams {
@@ -32,9 +32,9 @@ float mapToneCurve(float inputNits, float inputSpan)
 {
     float span = max(inputSpan, 1e-3);
     float u = clamp(inputNits / span, 0.0, 1.0);
-    float idx = u * 1023.0;
+    float idx = u * 4095.0;
     int i0 = int(floor(idx));
-    int i1 = min(i0 + 1, 1023);
+    int i1 = min(i0 + 1, 4095);
     float t = fract(idx);
     float y0 = toneCurveLutPacked[i0 / 4][i0 % 4];
     float y1 = toneCurveLutPacked[i1 / 4][i1 % 4];

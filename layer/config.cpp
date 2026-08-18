@@ -82,6 +82,9 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     if (auto v = table["dither_strength"].value<double>()) {
         settings.ditherStrength = AutoHdr::clampDitherStrength(static_cast<float>(*v));
     }
+    if (auto v = table["deband_strength"].value<double>()) {
+        settings.debandStrength = AutoHdr::clampDebandStrength(static_cast<float>(*v));
+    }
     if (auto v = table["perceptual_color"].value<bool>()) {
         settings.perceptualColor = *v;
     }
@@ -111,6 +114,7 @@ void finalizeSettings(AutoHdr::CalibrationSettings &settings)
     settings.gamutExpansion = AutoHdr::clampGamutExpansion(settings.gamutExpansion);
     settings.highlightSoftness = AutoHdr::clampHighlightSoftness(settings.highlightSoftness);
     settings.ditherStrength = AutoHdr::clampDitherStrength(settings.ditherStrength);
+    settings.debandStrength = AutoHdr::clampDebandStrength(settings.debandStrength);
 
     if (settings.toneCurvePreset != AutoHdr::ToneCurvePreset::Custom) {
         AutoHdr::applyToneCurvePreset(settings);
@@ -321,7 +325,7 @@ bool wantPreferHdrSwapchain()
 }
 
 bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float blackFloor,
-                         float highlightStretch)
+                         float highlightStretch, float debandStrength)
 {
     std::lock_guard lock(g_configMutex);
     ensureLoaded();
@@ -331,6 +335,7 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
     expansionShape = AutoHdr::clampExpansionShape(expansionShape);
     blackFloor = AutoHdr::clampBlackFloor(blackFloor);
     highlightStretch = AutoHdr::clampHighlightStretch(highlightStretch);
+    debandStrength = AutoHdr::clampDebandStrength(debandStrength);
 
     // Update in-memory first so subsequent activeSettings() sees the new values.
     if (Profile *profile = const_cast<Profile *>(matchingProfileLocked())) {
@@ -339,12 +344,14 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
         profile->settings.expansionShape = expansionShape;
         profile->settings.blackFloor = blackFloor;
         profile->settings.highlightStretch = highlightStretch;
+        profile->settings.debandStrength = debandStrength;
     } else {
         g_config.global.intensity = intensity;
         g_config.global.colorIntensity = colorIntensity;
         g_config.global.expansionShape = expansionShape;
         g_config.global.blackFloor = blackFloor;
         g_config.global.highlightStretch = highlightStretch;
+        g_config.global.debandStrength = debandStrength;
     }
 
     if (g_config.configPath.empty()) {
@@ -381,6 +388,7 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
                 table->insert_or_assign("black_floor", static_cast<double>(blackFloor));
                 table->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
+                table->insert_or_assign("deband_strength", static_cast<double>(debandStrength));
                 updated = true;
                 break;
             }
@@ -392,6 +400,7 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table.insert("expansion_shape", static_cast<double>(expansionShape));
                 table.insert("black_floor", static_cast<double>(blackFloor));
                 table.insert("highlight_stretch", static_cast<double>(highlightStretch));
+                table.insert("deband_strength", static_cast<double>(debandStrength));
                 arr->push_back(std::move(table));
             }
         } else {
@@ -405,6 +414,7 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
             global->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
             global->insert_or_assign("black_floor", static_cast<double>(blackFloor));
             global->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
+            global->insert_or_assign("deband_strength", static_cast<double>(debandStrength));
         }
 
         const std::filesystem::path tmp = path.string() + ".tmp";

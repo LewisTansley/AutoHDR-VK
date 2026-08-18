@@ -7,7 +7,7 @@
 
 namespace AutoHdr {
 
-constexpr int kToneCurveLutSize = 1024;
+constexpr int kToneCurveLutSize = 4096;
 
 struct ToneCurveEndpoints {
     float peakNits = 1000.0f;
