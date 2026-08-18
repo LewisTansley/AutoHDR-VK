@@ -1,4 +1,4 @@
-// Mpv-style iterative deband on locally flat SDR ramps, plus post-map grain.
+// Split deband: classic mpv on large low-frequency flats; skip taps that hit hard geometry.
 
 float debandIgn(vec2 p)
 {
@@ -14,6 +14,7 @@ vec2 debandHashDir(uvec2 gid, int iter)
 
 vec3 debandSampleInputNits(vec2 uv, vec2 texel, float ref, float inputIsSrgbFlag)
 {
+    uv = (floor(uv / texel) + 0.5) * texel;
     uv = clamp(uv, texel * 0.5, vec2(1.0) - texel * 0.5);
     vec3 rgb = texture(uInput, uv).rgb;
     if (inputIsSrgbFlag > 0.5) {
@@ -22,11 +23,10 @@ vec3 debandSampleInputNits(vec2 uv, vec2 texel, float ref, float inputIsSrgbFlag
     return max(rgb * ref, vec3(0.0));
 }
 
-float debandLocalLumaRange(vec3 centerSdrNits, vec2 uv, vec2 texel, float ref, float inputIsSrgbFlag)
+float debandLocalRgbRange(vec3 centerSdrNits, vec2 uv, vec2 texel, float ref, float inputIsSrgbFlag)
 {
-    float lumaC = max(luminanceYNits(centerSdrNits), 1e-6);
-    float lumaMin = lumaC;
-    float lumaMax = lumaC;
+    vec3 rgbMin = centerSdrNits;
+    vec3 rgbMax = centerSdrNits;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) {
@@ -34,35 +34,55 @@ float debandLocalLumaRange(vec3 centerSdrNits, vec2 uv, vec2 texel, float ref, f
             }
             vec3 sampleNits = debandSampleInputNits(uv + vec2(float(dx), float(dy)) * texel, texel, ref,
                                                    inputIsSrgbFlag);
-            float luma = max(luminanceYNits(sampleNits), 1e-6);
-            lumaMin = min(lumaMin, luma);
-            lumaMax = max(lumaMax, luma);
+            rgbMin = min(rgbMin, sampleNits);
+            rgbMax = max(rgbMax, sampleNits);
         }
     }
-    return lumaMax - lumaMin;
+    vec3 range = rgbMax - rgbMin;
+    return max(range.r, max(range.g, range.b));
 }
 
 bool debandIsFlat(float localRange, float ref)
 {
-    return localRange <= 2.5 * (ref / 255.0);
+    return localRange <= 4.0 * (ref / 255.0);
 }
 
 vec3 applyMpvDeband(vec3 color, vec2 uv, vec2 texel, uvec2 gid, float ref, float inputIsSrgbFlag,
-                    float debandStrength)
+                    float debandStrength, out float mixed)
 {
-    float rangePx = mix(8.0, 16.0, debandStrength);
-    float thrNits = mix(1.0, 3.0, debandStrength) * (ref / 255.0);
+    mixed = 0.0;
+    float rel = clamp(luminanceYNits(color) / max(ref, 1e-6), 0.0, 1.0);
+    float shadowW = smoothstep(0.08, 0.22, rel);
+    if (shadowW <= 1e-4) {
+        return color;
+    }
+
+    float rangePx = mix(8.0, 20.0, debandStrength) * shadowW;
+    float thrNits = mix(1.5, 4.0, debandStrength) * (ref / 255.0) * shadowW;
     const int iters = 4;
 
     for (int i = 1; i <= iters; ++i) {
+        float luma = max(luminanceYNits(color), 1e-6);
+        float hardLsb = mix(4.0, 10.0, clamp(luma / ref, 0.0, 1.0));
+        float hardLim = hardLsb * (ref / 255.0);
+        vec3 hard3 = vec3(hardLim);
+
         float dist = rangePx * float(i) / float(iters);
         vec2 dir = debandHashDir(gid, i);
         vec2 offsetUv = dir * dist * texel;
-        vec3 avg = 0.5 * (debandSampleInputNits(uv + offsetUv, texel, ref, inputIsSrgbFlag)
-                          + debandSampleInputNits(uv - offsetUv, texel, ref, inputIsSrgbFlag));
-        vec3 diff = abs(avg - color);
+        vec3 s1 = debandSampleInputNits(uv + offsetUv, texel, ref, inputIsSrgbFlag);
+        vec3 s2 = debandSampleInputNits(uv - offsetUv, texel, ref, inputIsSrgbFlag);
+        if (any(greaterThan(abs(s1 - color), hard3)) || any(greaterThan(abs(s2 - color), hard3))
+            || any(greaterThan(abs(s1 - s2), hard3))) {
+            continue;
+        }
+        vec3 avg = 0.5 * (s1 + s2);
         float lim = thrNits * float(i);
-        color = mix(avg, color, vec3(greaterThan(diff, vec3(lim))));
+        bvec3 keep = greaterThan(abs(avg - color), vec3(lim));
+        if (!all(keep)) {
+            mixed = 1.0;
+        }
+        color = mix(avg, color, vec3(keep));
     }
 
     return color;
@@ -76,14 +96,18 @@ vec3 applyInputDeband(vec3 centerSdrNits, vec2 uv, uvec2 imageExtent, uvec2 gid,
         return centerSdrNits;
     }
 
+    float rel = clamp(luminanceYNits(centerSdrNits) / max(ref, 1e-6), 0.0, 1.0);
+    if (smoothstep(0.08, 0.22, rel) <= 1e-4) {
+        return centerSdrNits;
+    }
+
     vec2 texel = 1.0 / vec2(imageExtent);
-    float localRange = debandLocalLumaRange(centerSdrNits, uv, texel, ref, inputIsSrgbFlag);
+    float localRange = debandLocalRgbRange(centerSdrNits, uv, texel, ref, inputIsSrgbFlag);
     if (!debandIsFlat(localRange, ref)) {
         return centerSdrNits;
     }
 
-    flatMask = 1.0;
-    return applyMpvDeband(centerSdrNits, uv, texel, gid, ref, inputIsSrgbFlag, debandStrength);
+    return applyMpvDeband(centerSdrNits, uv, texel, gid, ref, inputIsSrgbFlag, debandStrength, flatMask);
 }
 
 vec3 applyDebandGrain(vec3 rgbNits, uvec2 pixel, float debandStrength, float flatMask)
@@ -92,7 +116,7 @@ vec3 applyDebandGrain(vec3 rgbNits, uvec2 pixel, float debandStrength, float fla
         return rgbNits;
     }
 
-    float grainNits = mix(0.0, 1.5, debandStrength);
+    float grainNits = mix(0.0, 0.8, debandStrength);
     vec2 p = vec2(pixel) + 0.5;
     vec3 noise = vec3(
         debandIgn(p) + debandIgn(p + vec2(5.2, 1.3)) - 1.0,
