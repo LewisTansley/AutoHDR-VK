@@ -1,5 +1,6 @@
 // ITU-R BT.2100 ICtCp helpers (linear BT.709 RGB in/out for layer working space)
 // GLSL mat3 constructors are COLUMN-major: each triplet is one column.
+// Dolby ICtCp LMS (not HPE); LMS_TO_XYZ is the true inverse of XYZ_TO_LMS.
 
 #ifndef ICTCP_GLSL
 #define ICTCP_GLSL
@@ -20,27 +21,28 @@ const mat3 ICTCP_BT2020_TO_XYZ = mat3(
     0.1446169, 0.6779981, 0.0280727,
     0.1688559, 0.0593017, 1.0609851);
 
-// XYZ -> LMS (Hunt-Pointer-Estevez variant used with ICtCp)
+// XYZ -> Dolby LMS (ICtCp / BT.2100)
 const mat3 ICTCP_XYZ_TO_LMS = mat3(
-    0.3592, -0.1922, 0.0070,
-    0.6976, 1.1004, 0.0749,
-    -0.0358, 0.0755, 0.8434);
+    0.3593, -0.1921, 0.0071,
+    0.6976, 1.1005, 0.0748,
+    -0.0359, 0.0754, 0.8433);
 
+// True inverse of ICTCP_XYZ_TO_LMS
 const mat3 ICTCP_LMS_TO_XYZ = mat3(
-    2.0701801, 0.3649882, -0.0496855,
-    -1.3264565, 0.6805696, -0.0493859,
-    0.2066160, -0.0453025, 1.1889440);
+    2.0700345211, 0.3647497845, -0.0497812510,
+    -1.3262311820, 0.6805456704, -0.0491978830,
+    0.2067023247, -0.0453203205, 1.1880972056);
 
-// LMS_PQ -> ICtCp (BT.2100)
+// LMS_PQ -> ICtCp (BT.2100 exact 4096 fractions)
 const mat3 ICTCP_LMS_TO_ICTCP = mat3(
-    0.5, 1.6137695, 4.3780623,
-    0.5, -3.3234862, -4.2455399,
-    0.0, 1.7097167, -0.1325225);
+    2048.0 / 4096.0, 6610.0 / 4096.0, 17933.0 / 4096.0,
+    2048.0 / 4096.0, -13613.0 / 4096.0, -17390.0 / 4096.0,
+    0.0, 7003.0 / 4096.0, -543.0 / 4096.0);
 
 const mat3 ICTCP_ICTCP_TO_LMS = mat3(
     1.0, 1.0, 1.0,
-    0.0086090, -0.0086090, 0.5600313,
-    0.1110296, -0.1110296, -0.3206271);
+    0.00860903703793, -0.00860903703793, 0.56003133571068,
+    0.11102962500303, -0.11102962500303, -0.32062717498732);
 
 float ictcpPqEotf(float v)
 {
@@ -82,7 +84,8 @@ vec3 iCtCpToLinearRgb(vec3 ictcp)
     vec3 lmsPq = ICTCP_ICTCP_TO_LMS * ictcp;
     vec3 lms = vec3(ictcpPqEotf(lmsPq.x), ictcpPqEotf(lmsPq.y), ictcpPqEotf(lmsPq.z));
     vec3 xyz = ICTCP_LMS_TO_XYZ * lms;
-    return max(ICTCP_XYZ_TO_RGB * xyz * 10000.0, vec3(0.0));
+    // Do not clip Rec.709 negatives here — out-of-gamut values may become valid in BT.2020 at encode.
+    return ICTCP_XYZ_TO_RGB * xyz * 10000.0;
 }
 
 #endif

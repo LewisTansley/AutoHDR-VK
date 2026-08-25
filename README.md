@@ -96,7 +96,7 @@ cp conf.example.toml ~/.config/autohdr-vk/conf.toml
 Important keys under `[global]`:
 
 - **`intensity`** — primary look control (Windows AutoHDR-style): `0` ≈ SDR, `1` = full peak headroom. Linear blend toward the tonemapped result.
-- **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full chroma restore and full `gamut_expansion`). Overlay **Color** slider.
+- **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full ICtCp chroma preserve and full `gamut_expansion`). Overlay **Color** slider.
 - **`expansion_shape`** — shadow→highlight curve shape (`0` = linear / brighter mids, `1` = exponential / darker mids). Overlay **Shape** slider.
 - **`black_floor`** — raised-floor black crush (`0` = off, `1` = max). Overlay **Floor** slider. Use when a game's blacks look lifted/foggy.
 - **`highlight_stretch`** — histogram highlight pre-stretch (`0` = off, `0.45` = default, `1` = legacy max, `2` = aggressive). Overlay **Stretch** slider. Raise for muted masters (e.g. Big Walk) where near-whites sit below peak.
@@ -129,12 +129,13 @@ App / DXVK → Vulkan loader → VK_LAYER_AUTOHDR_tonemap → ICD → WSI → co
 On present, the layer copies the swapchain image and runs a compute pipeline:
 
 1. **Histogram** — scene luminance stats (geo-mean, p05/p25/p90/near-max); mild highlight-tail pre-stretch when content white is below peak; maxCLL/maxFALL for HDR metadata
-2. **UI cluster** — 8×8 tile mask to lock flat UI/text to SDR white
-3. **Base blur** — half-res linear base layer for detail preservation
-4. **Tonemap** — tone LUT + perceptual color path with histogram range adapt, UI mask blend, PQ/scRGB/SDR encode
-5. **Overlay** (optional) — in-swapchain intensity/color calibrator HUD
+2. **UI cluster** — 8×8 tile mask to lock flat UI/text to SDR white (currently gated off)
+3. **Tonemap** — tone LUT owns CIE-Y luminance (histogram adapt, black floor, expansion shape); ICtCp applies that `yOut` with Ct/Cp preserved and CIE-Y lock; gamut expand + CIE-Y peak limit; then PQ (BT.2020)/scRGB/SDR encode
+4. **Overlay** (optional) — in-swapchain intensity/color calibrator HUD
 
 Then the result is blitted back to the swapchain for present.
+
+Working color space is linear Rec.709 nits. HDR10 (`encoding = pq` / auto on ST2084 swapchains) converts Rec.709 → BT.2020 immediately before ST.2084 encode so compositors (e.g. KWin) see correct primaries.
 
 ## Limitations
 

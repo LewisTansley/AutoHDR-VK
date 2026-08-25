@@ -2,10 +2,15 @@ AutoHDR-VK
 ==========
 
 Tone-curve evaluation, preset curves, and core SDR→HDR color processing
-(black point, perceptual luminance remap, gamut expansion helpers) are
-adapted from PlasmaAutoHDR:
+(black point, gamut expansion helpers) are adapted from PlasmaAutoHDR:
 
   https://github.com/LewisTansley/PlasmaAutoHDR
+
+ICtCp conversion (Dolby LMS, BT.2100 LMS_PQ↔ICtCp matrices, PQ EOTF)
+follows ITU-R BT.2100 and published Dolby ICtCp LMS coefficients. The
+I-only luminance application with Ct/Cp preserved follows the same
+approach used by Plasma/KWin color management for hue-stable tonemapping;
+this repository does not copy KWin source.
 
 The Vulkan layer scaffolding, present-time pipeline, TOML configuration,
 and packaging in this repository are original to AutoHDR-VK.

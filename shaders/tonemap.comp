@@ -1,8 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-// Legacy tone-curve + perceptual color path on the compute scaffold.
-// Intensity is a linear post-map blend (0 = SDR, 1 = full legacy HDR look).
+// Tone-curve + ICtCp perceptual color path on the compute scaffold.
+// Intensity is a linear post-map blend (0 = SDR, 1 = full HDR look).
+// Luminance (histogram / floor / LUT / CIE-Y peak) is unchanged; ICtCp only applies yOut to RGB.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D uInput;
@@ -79,7 +80,7 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
     float effectiveGamut = max(gamutExpansion, 0.0) * clamp(colorIntensity, 0.0, 1.0);
 
     if (perceptualColorEnabled > 0.5) {
-        rgbNits = applyPerceptualLuminanceMap(rgbNits, rawLumaNits, outputNits, colorIntensity, pqBoostParams);
+        rgbNits = applyICtCpLuminanceMap(rgbNits, rawLumaNits, outputNits, colorIntensity);
         if (effectiveGamut > 0.0) {
             rgbNits = expandGamutSmart(rgbNits / ref, effectiveGamut) * ref;
         }
@@ -137,7 +138,9 @@ void main()
 
     vec3 outRgb;
     if (outputMode < 0.5) {
-        outRgb = autohdrLinearToPq(rgbNits, 10000.0);
+        // HDR10 ST2084 expects BT.2020 + PQ (encode-only; working space stays Rec.709).
+        vec3 bt2020Nits = max(autohdrRec709ToBt2020(rgbNits), vec3(0.0));
+        outRgb = autohdrLinearToPq(bt2020Nits, 10000.0);
         outRgb = clamp(outRgb, 0.0, 1.0);
     } else if (outputMode < 1.5) {
         outRgb = rgbNits / 80.0;

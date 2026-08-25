@@ -1,6 +1,14 @@
 // Shared AutoHDR color helpers for the Vulkan layer (no KWin colormanagement).
 
+#include "ictcp.glsl"
+
 const vec3 AUTOHDR_LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+// Rec.709 linear → BT.2020 linear (via XYZ), for HDR10 PQ encode only.
+const mat3 AUTOHDR_REC709_TO_BT2020 = mat3(
+    0.62740466, 0.06909699, 0.01639143,
+    0.32928679, 0.91953894, 0.08801336,
+    0.04335164, 0.01134733, 0.89559566);
 
 const float AUTOHDR_PQ_N = 0.1593017578125;
 const float AUTOHDR_PQ_RCP_N = 6.2773946361256;
@@ -138,6 +146,7 @@ float autohdrComputePqMul(float yIn, float yOut, vec4 pqParams)
     return pqOut / max(pqIn, 1e-6);
 }
 
+// Legacy XYZ/PQ applicator (unused by live tonemap.comp; kept for orphan tonemap.frag).
 vec3 applyPerceptualLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colorIntensity, vec4 pqParams)
 {
     float p0 = pqParams.x;
@@ -170,6 +179,37 @@ vec3 applyPerceptualLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colo
         xyzResult = mix(yOnlyXyz, boosted, clamp(colorIntensity, 0.0, 1.0));
     }
     return autohdrXyzToRec709(xyzResult);
+}
+
+// ICtCp I-only applicator: LUT still owns yOut; Ct/Cp unchanged; CIE-Y locked to yOut.
+vec3 applyICtCpLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colorIntensity)
+{
+    float scale = yOut / max(yIn, 1e-6);
+    if (abs(scale - 1.0) < 1e-4) {
+        return rgbNits;
+    }
+
+    vec3 yOnlyRgb = rgbNits * scale;
+    if (colorIntensity <= 0.001) {
+        return yOnlyRgb;
+    }
+
+    vec3 ictcp = linearRgbToICtCp(rgbNits);
+    float iLinear = ictcpPqEotf(ictcp.x) * 10000.0;
+    float iLinearOut = max(iLinear * scale, 0.0);
+    ictcp.x = ictcpPqInvEotf(iLinearOut / 10000.0);
+    // Ct / Cp left unchanged
+
+    vec3 mapped = iCtCpToLinearRgb(ictcp);
+    float yMapped = max(luminanceYNits(mapped), 1e-6);
+    mapped *= yOut / yMapped;
+
+    return mix(yOnlyRgb, mapped, clamp(colorIntensity, 0.0, 1.0));
+}
+
+vec3 autohdrRec709ToBt2020(vec3 linearRec709Nits)
+{
+    return AUTOHDR_REC709_TO_BT2020 * linearRec709Nits;
 }
 
 vec3 reconstructHighlights(vec3 rgbNits, float refNits)
