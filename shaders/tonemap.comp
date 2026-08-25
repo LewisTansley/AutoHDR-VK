@@ -76,8 +76,9 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
     float curveInputNits = applyUserBlackPoint(yRel, blackPoint) * ref;
     float outputNits = mapToneCurve(curveInputNits, curveSpan);
 
-    // Color slider gates gamut expand: 0 = none, 1 = full gamut_expansion max.
-    float effectiveGamut = max(gamutExpansion, 0.0) * clamp(colorIntensity, 0.0, 1.0);
+    // Color gates gamut expand; slider 0–1 = former 0–0.4 band (same cEff as ICtCp vibrance).
+    float cEff = clamp(colorIntensity, 0.0, 1.0) * 0.4;
+    float effectiveGamut = max(gamutExpansion, 0.0) * pow(cEff, 0.65);
 
     if (perceptualColorEnabled > 0.5) {
         rgbNits = applyICtCpLuminanceMap(rgbNits, rawLumaNits, outputNits, colorIntensity);

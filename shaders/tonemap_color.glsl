@@ -181,7 +181,26 @@ vec3 applyPerceptualLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colo
     return autohdrXyzToRec709(xyzResult);
 }
 
-// ICtCp I-only applicator: LUT still owns yOut; Ct/Cp unchanged; CIE-Y locked to yOut.
+// Pull negative Rec.709 channels toward CIE Y until all channels are non-negative (preserve Y).
+vec3 softPullPositiveRgb(vec3 rgbNits)
+{
+    float y = luminanceYNits(rgbNits);
+    if (!(y > 1e-8) || any(isnan(rgbNits)) || any(isinf(rgbNits))) {
+        return vec3(0.0);
+    }
+    float minC = min(rgbNits.r, min(rgbNits.g, rgbNits.b));
+    if (minC >= 0.0) {
+        return rgbNits;
+    }
+    // rgb = mix(gray, rgb, t) with gray = vec3(y); solve min channel >= 0.
+    // minC' = mix(y, minC, t) >= 0 → t <= y / (y - minC) when minC < y.
+    float tMax = y / max(y - minC, 1e-6);
+    float t = clamp(tMax, 0.0, 1.0);
+    return mix(vec3(y), rgbNits, t);
+}
+
+// ICtCp applicator: LUT still owns yOut; CIE-Y locked after chroma restore/vibrance.
+// Slider 0–1 maps the former useful 0–0.4 band (Color=1 ≈ old Color=0.4).
 vec3 applyICtCpLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colorIntensity)
 {
     float scale = yOut / max(yIn, 1e-6);
@@ -190,21 +209,35 @@ vec3 applyICtCpLuminanceMap(vec3 rgbNits, float yIn, float yOut, float colorInte
     }
 
     vec3 yOnlyRgb = rgbNits * scale;
-    if (colorIntensity <= 0.001) {
+    float c = clamp(colorIntensity, 0.0, 1.0);
+    if (c <= 0.001) {
         return yOnlyRgb;
     }
+
+    // Stretch old 0–0.4 response across the full slider; structure reaches full ICtCp at Color=1.
+    float cEff = c * 0.4;
+    float structureMix = c;
 
     vec3 ictcp = linearRgbToICtCp(rgbNits);
     float iLinear = ictcpPqEotf(ictcp.x) * 10000.0;
     float iLinearOut = max(iLinear * scale, 0.0);
     ictcp.x = ictcpPqInvEotf(iLinearOut / 10000.0);
-    // Ct / Cp left unchanged
 
-    vec3 mapped = iCtCpToLinearRgb(ictcp);
-    float yMapped = max(luminanceYNits(mapped), 1e-6);
+    // Soft capped chroma restore — uncapped iOut/iIn explodes under strong Shape expand.
+    float iRatio = iLinearOut / max(iLinear, 1e-6);
+    float chromaRestore = mix(1.0, min(iRatio, 1.2), 0.35);
+    float chromaMul = chromaRestore * (1.0 + 0.45 * cEff);
+    ictcp.y *= chromaMul;
+    ictcp.z *= chromaMul;
+
+    vec3 mapped = softPullPositiveRgb(iCtCpToLinearRgb(ictcp));
+    float yMapped = luminanceYNits(mapped);
+    if (!(yMapped > 1e-6) || any(isnan(mapped)) || any(isinf(mapped))) {
+        return yOnlyRgb;
+    }
     mapped *= yOut / yMapped;
 
-    return mix(yOnlyRgb, mapped, clamp(colorIntensity, 0.0, 1.0));
+    return mix(yOnlyRgb, mapped, structureMix);
 }
 
 vec3 autohdrRec709ToBt2020(vec3 linearRec709Nits)

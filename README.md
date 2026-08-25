@@ -75,7 +75,7 @@ Force off: `DISABLE_AUTOHDR=1`.
 While the overlay is open:
 
 - **Up/Down** or **Tab** — cycle Intensity / Shape (`expansion_shape`) / Stretch (`highlight_stretch`) / Floor (`black_floor`) / Color (`color_intensity`)
-- **Left/Right** — adjust ±0.05 (hold **Shift** for ±0.01); **Floor** uses finer steps (±0.005, Shift ±0.001)
+- **Left/Right** — adjust ±0.005 (hold **Shift** for ±0.05)
 - **Super+H** again — close and save to `conf.toml`
 - **Esc** — close and discard changes
 - Mouse drag on slider tracks (X11/XWayland absolute pointer, or Wayland/Proton Wayland via a virtual HUD cursor when the game locks the mouse)
@@ -96,7 +96,7 @@ cp conf.example.toml ~/.config/autohdr-vk/conf.toml
 Important keys under `[global]`:
 
 - **`intensity`** — primary look control (Windows AutoHDR-style): `0` ≈ SDR, `1` = full peak headroom. Linear blend toward the tonemapped result.
-- **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full ICtCp chroma preserve and full `gamut_expansion`). Overlay **Color** slider.
+- **`color_intensity`** — saturation / chroma strength (`0` = luma-only + no gamut expand, `1` = full ICtCp chroma restore + moderate vibrance/gamut — the former ~0.4 ceiling stretched across the slider). Overlay **Color** slider.
 - **`expansion_shape`** — shadow→highlight curve shape (`0` = linear / brighter mids, `1` = exponential / darker mids). Overlay **Shape** slider.
 - **`black_floor`** — raised-floor black crush (`0` = off, `1` = max). Overlay **Floor** slider. Use when a game's blacks look lifted/foggy.
 - **`highlight_stretch`** — histogram highlight pre-stretch (`0` = off, `0.45` = default, `1` = legacy max, `2` = aggressive). Overlay **Stretch** slider. Raise for muted masters (e.g. Big Walk) where near-whites sit below peak.
@@ -104,7 +104,7 @@ Important keys under `[global]`:
 - `prefer_hdr_swapchain` — try to select an HDR10 surface format/colorspace at swapchain create
 - `set_hdr_metadata` — call `vkSetHdrMetadataEXT` when available (maxCLL/maxFALL from scene stats)
 
-Advanced overrides (optional / back-compat): `reference_nits`, `peak_nits`, `tone_curve_preset`, `gamut_expansion` (max expand scale when Color = 1), `dither` / `dither_strength` (IGN bit-depth dither before swapchain quantize; on by default), etc.
+Advanced overrides (optional / back-compat): `reference_nits`, `peak_nits`, `tone_curve_preset`, `gamut_expansion` (max expand scale when Color = 1; default `1.5`), `dither` / `dither_strength` (IGN bit-depth dither before swapchain quantize; on by default), etc.
 
 Per-exe overrides:
 
@@ -130,7 +130,7 @@ On present, the layer copies the swapchain image and runs a compute pipeline:
 
 1. **Histogram** — scene luminance stats (geo-mean, p05/p25/p90/near-max); mild highlight-tail pre-stretch when content white is below peak; maxCLL/maxFALL for HDR metadata
 2. **UI cluster** — 8×8 tile mask to lock flat UI/text to SDR white (currently gated off)
-3. **Tonemap** — tone LUT owns CIE-Y luminance (histogram adapt, black floor, expansion shape); ICtCp applies that `yOut` with Ct/Cp preserved and CIE-Y lock; gamut expand + CIE-Y peak limit; then PQ (BT.2020)/scRGB/SDR encode
+3. **Tonemap** — tone LUT owns CIE-Y luminance (histogram adapt, black floor, expansion shape); ICtCp applies that `yOut` with chroma restore/vibrance (Color slider) and CIE-Y lock; gamut expand into HDR headroom + CIE-Y peak limit; then PQ (BT.2020)/scRGB/SDR encode
 4. **Overlay** (optional) — in-swapchain intensity/color calibrator HUD
 
 Then the result is blitted back to the swapchain for present.

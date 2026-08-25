@@ -5,7 +5,7 @@
 # Primary look control (Windows AutoHDR-style). 0 = near-SDR, 1 = full peak.
 intensity = 0.5
 
-# Saturation / chroma strength (0 = luma-only + no gamut expand, 1 = full ICtCp chroma preserve). Overlay "Color" slider.
+# Saturation / chroma (0 = luma-only; 1 = former moderate ~0.4 chroma/gamut ceiling, stretched across the slider). Overlay "Color".
 # Also scales gamut_expansion (see advanced overrides).
 color_intensity = 0.33
 
@@ -22,7 +22,7 @@ highlight_stretch = 0.45
 # reference_nits = 203
 # peak_nits = 1000
 # black_point = 0.0   # legacy linear offset; prefer black_floor
-# gamut_expansion = 1.0   # max expand scale when color_intensity = 1
+# gamut_expansion = 1.5   # max expand scale when color_intensity = 1 (default 1.5)
 # highlight_softness = 0.30
 # perceptual_color = true
 # tone_curve_preset = "balanced"

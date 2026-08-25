@@ -10,7 +10,7 @@ namespace AutoHdr {
 
 struct CalibrationSettings {
     float maxNits = 1000.0f;
-    float gamutExpansion = 1.0f;
+    float gamutExpansion = 1.5f;
     float blackPoint = 0.0f; // legacy config-only offset; prefer blackFloor overlay slider
     float blackFloor = 0.0f; // 0 = off, 1 = max raised-floor crush (maps to blackPoint * 0.05)
     float colorIntensity = 0.33f;

@@ -148,15 +148,9 @@ void adjustFocusedLocked(float delta)
     g_state.hasDraft = true;
 }
 
-float adjustStepForFocused(FocusedSlider focused, bool shift)
+float adjustStepForFocused(FocusedSlider /*focused*/, bool shift)
 {
-    if (focused == FocusedSlider::BlackFloor) {
-        return shift ? 0.001f : 0.005f;
-    }
-    if (focused == FocusedSlider::DitherStrength) {
-        return shift ? 0.01f : 0.05f;
-    }
-    return shift ? 0.01f : 0.05f;
+    return shift ? 0.05f : 0.005f;
 }
 
 FocusedSlider nextSlider(FocusedSlider cur)
