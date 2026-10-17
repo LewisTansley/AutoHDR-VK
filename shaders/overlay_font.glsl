@@ -9,12 +9,15 @@ int overlayCharIndex(int codepoint)
     if (codepoint >= 97 && codepoint <= 122) {
         return codepoint - 97;
     }
+    if (codepoint >= 48 && codepoint <= 57) {
+        return 26 + (codepoint - 48);
+    }
     return -1;
 }
 
 float sampleGlyphAlpha(vec2 local, int glyphIndex)
 {
-    if (glyphIndex < 0 || glyphIndex >= 26) {
+    if (glyphIndex < 0 || glyphIndex >= kOverlayGlyphCount) {
         return 0.0;
     }
     OverlayGlyph g = kOverlayGlyphs[glyphIndex];
@@ -42,7 +45,25 @@ float drawGlyph(vec2 p, inout vec2 cursor, float scale, int codepoint)
     return alpha;
 }
 
-float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
+float drawSliderValue(vec2 p, vec2 origin, float scale, float value01)
+{
+    int pct = int(round(clamp(value01, 0.0, 1.0) * 100.0));
+    vec2 cursor = origin;
+    float alpha = 0.0;
+    if (pct >= 100) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 49)); // 1
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 48)); // 0
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 48)); // 0
+        return alpha;
+    }
+    if (pct >= 10) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 48 + (pct / 10)));
+    }
+    alpha = max(alpha, drawGlyph(p, cursor, scale, 48 + (pct % 10)));
+    return alpha;
+}
+
+float drawLabelRow(vec2 p, vec2 origin, float scale, int row, float splitCurveSliders)
 {
     vec2 cursor = origin;
     float alpha = 0.0;
@@ -59,6 +80,14 @@ float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
         return alpha;
     }
     if (row == 1) {
+        if (splitCurveSliders < 0.5) {
+            alpha = max(alpha, drawGlyph(p, cursor, scale, 67)); // C
+            alpha = max(alpha, drawGlyph(p, cursor, scale, 85)); // U
+            alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
+            alpha = max(alpha, drawGlyph(p, cursor, scale, 86)); // V
+            alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+            return alpha;
+        }
         alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S
         alpha = max(alpha, drawGlyph(p, cursor, scale, 72)); // H
         alpha = max(alpha, drawGlyph(p, cursor, scale, 65)); // A
@@ -68,6 +97,22 @@ float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
     }
     if (row == 2) {
         alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 67)); // C
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 85)); // U
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 86)); // V
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+        return alpha;
+    }
+    if (row == 3) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 75)); // K
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 78)); // N
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+        return alpha;
+    }
+    if (row == 4) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S
         alpha = max(alpha, drawGlyph(p, cursor, scale, 84)); // T
         alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
         alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
@@ -76,7 +121,15 @@ float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
         alpha = max(alpha, drawGlyph(p, cursor, scale, 72)); // H
         return alpha;
     }
-    if (row == 3) {
+    if (row == 5) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 87)); // W
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 72)); // H
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 73)); // I
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 84)); // T
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+        return alpha;
+    }
+    if (row == 6) {
         alpha = max(alpha, drawGlyph(p, cursor, scale, 70)); // F
         alpha = max(alpha, drawGlyph(p, cursor, scale, 76)); // L
         alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
@@ -84,12 +137,31 @@ float drawLabelRow(vec2 p, vec2 origin, float scale, int row)
         alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
         return alpha;
     }
-    if (row == 4) {
+    if (row == 7) {
         alpha = max(alpha, drawGlyph(p, cursor, scale, 67)); // C
         alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
         alpha = max(alpha, drawGlyph(p, cursor, scale, 76)); // L
         alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
         alpha = max(alpha, drawGlyph(p, cursor, scale, 82)); // R
+        return alpha;
+    }
+    if (row == 8) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 66)); // B
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 76)); // L
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 87)); // W
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 85)); // U
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 84)); // T
+        return alpha;
+    }
+    if (row == 9) {
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 79)); // O
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 70)); // F
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 84)); // T
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 69)); // E
+        alpha = max(alpha, drawGlyph(p, cursor, scale, 78)); // N
         return alpha;
     }
     alpha = max(alpha, drawGlyph(p, cursor, scale, 83)); // S

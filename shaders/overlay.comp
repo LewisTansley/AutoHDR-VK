@@ -1,7 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-// In-swapchain calibrator HUD: intensity + shape + stretch + floor + color sliders.
+// In-swapchain calibrator HUD: intensity + curve/shape + scurve + knee + stretch + white + floor + color + blowout + soften + smooth.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std140, set = 0, binding = 0) uniform OverlayParams {
@@ -9,7 +9,9 @@ layout(std140, set = 0, binding = 0) uniform OverlayParams {
     float intensity;
     float colorIntensity;
     float expansionShape;
-    float focused;    // 0 = intensity, 1 = shape, 2 = stretch, 3 = floor, 4 = color
+    float expansionScurve;
+    float expansionMid;
+    float focused;    // 0=intensity … 10=smooth
     float outputMode; // 0=pq, 1=scrgb, 2=sdr
     float panelNits;
     float pointerValid;
@@ -17,7 +19,21 @@ layout(std140, set = 0, binding = 0) uniform OverlayParams {
     float pointerY;
     float blackFloor;
     float highlightStretch;
+    float stretchWhiteRef;
+    float highlightBlowout;
+    float highlightSoftness;
     float debandStrength;
+    float sceneNearMax;
+    float sceneP90;
+    float sceneContentWhite;
+    float sceneStretchOut;
+    float sceneMaxCLL;
+    float sceneGap;
+    float sceneStatsValid;
+    float peakNitsRef;
+    float showIntensity;
+    float showFinishing;
+    float splitCurveSliders;
 };
 
 layout(set = 0, binding = 1, rgba16f) uniform image2D uImage;
@@ -49,6 +65,18 @@ vec3 encodeHud(vec3 linearRgb01, float nits)
     return linearRgb01;
 }
 
+void drawStatBar(inout vec3 outRgb, vec2 p, float barX0, float barX1, float barY0, float barY1, float value,
+                 vec3 color, float nits)
+{
+    if (p.x >= barX0 && p.x <= barX1 && p.y >= barY0 && p.y <= barY1) {
+        float t = clamp(value, 0.0, 1.0);
+        float fillX = mix(barX0, barX1, t);
+        vec3 bg = vec3(0.14, 0.16, 0.20);
+        vec3 col = (p.x <= fillX) ? color : bg;
+        outRgb = encodeHud(col, nits * 0.80);
+    }
+}
+
 void main()
 {
     uvec2 gid = gl_GlobalInvocationID.xy;
@@ -59,7 +87,9 @@ void main()
     float w = float(extent.x);
     float h = float(extent.y);
     float pw = min(520.0, w * 0.55);
-    float ph = 250.0;
+    float curveShift = splitCurveSliders > 0.5 ? 0.0 : 34.0;
+    float ph = 420.0 - (showIntensity > 0.5 ? 0.0 : 34.0) - (showFinishing > 0.5 ? 0.0 : 68.0) - curveShift;
+    float rowShift = showIntensity > 0.5 ? 0.0 : 34.0;
     float x0 = (w - pw) * 0.5;
     float y0 = h - ph - 48.0;
     float x1 = x0 + pw;
@@ -77,18 +107,46 @@ void main()
         outRgb = mix(cur.rgb, bg, 0.78);
 
         float trackX0 = x0 + 140.0;
-        float trackX1 = x0 + pw - 16.0;
+        float trackX1 = x0 + pw - 70.0;
         float trackH = 14.0;
-        // Row order: Intensity, Shape, Stretch, Floor, Color, Smooth
+        // Row order: Intensity, Shape/Curve, Scurve, Knee, Stretch, White, Floor, Color, Blowout, Soften, Smooth
         float intensityY = y0 + 34.0;
         float shapeY = y0 + 68.0;
-        float stretchY = y0 + 102.0;
-        float floorY = y0 + 136.0;
-        float colorY = y0 + 170.0;
-        float smoothY = y0 + 204.0;
+        float scurveY = y0 + 102.0;
+        float kneeY = y0 + 136.0;
+        float stretchY = y0 + 170.0;
+        float whiteY = y0 + 204.0;
+        float floorY = y0 + 238.0;
+        float colorY = y0 + 272.0;
+        float blowoutY = y0 + 306.0;
+        float softenY = y0 + 340.0;
+        float smoothY = y0 + 374.0;
 
         if (p.y < y0 + 22.0) {
             outRgb = mix(outRgb, encodeHud(vec3(0.15, 0.35, 0.55), nits * 0.55), 0.85);
+        }
+
+        if (sceneStatsValid > 0.5) {
+            const float statsY0 = y0 + 4.0;
+            const float statsY1 = y0 + 16.0;
+            const float statsW = 48.0;
+            const float statsGap = 6.0;
+            float statsX = x0 + 12.0;
+            float gapNorm = clamp(sceneGap * 2.0, 0.0, 1.0);
+            drawStatBar(outRgb, p, statsX, statsX + statsW, statsY0, statsY1, sceneNearMax,
+                        vec3(0.95, 0.35, 0.30), nits);
+            statsX += statsW + statsGap;
+            drawStatBar(outRgb, p, statsX, statsX + statsW, statsY0, statsY1, sceneP90,
+                        vec3(0.35, 0.85, 0.45), nits);
+            statsX += statsW + statsGap;
+            drawStatBar(outRgb, p, statsX, statsX + statsW, statsY0, statsY1, sceneContentWhite,
+                        vec3(0.95, 0.90, 0.25), nits);
+            statsX += statsW + statsGap;
+            drawStatBar(outRgb, p, statsX, statsX + statsW, statsY0, statsY1, sceneStretchOut,
+                        vec3(0.35, 0.65, 0.95), nits);
+            statsX += statsW + statsGap;
+            drawStatBar(outRgb, p, statsX, statsX + statsW, statsY0, statsY1, gapNorm,
+                        vec3(0.95, 0.65, 0.20), nits);
         }
 
         float b = 2.0;
@@ -98,25 +156,43 @@ void main()
 
         const float labelScale = 1.0;
 
-        for (int row = 0; row < 6; ++row) {
-            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : ((row == 2) ? stretchY : ((row == 3) ? floorY : ((row == 4) ? colorY : smoothY))));
-            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : ((row == 2) ? highlightStretch : ((row == 3) ? blackFloor : ((row == 4) ? colorIntensity : clamp(debandStrength, 0.0, 1.0)))));
+        for (int row = 0; row < 11; ++row) {
+            if (row == 0 && showIntensity < 0.5) {
+                continue;
+            }
+            if (row == 2 && splitCurveSliders < 0.5) {
+                continue;
+            }
+            if (row >= 9 && showFinishing < 0.5) {
+                continue;
+            }
+            float trackY = (row == 0) ? intensityY : ((row == 1) ? shapeY : ((row == 2) ? scurveY : ((row == 3) ? kneeY : ((row == 4) ? stretchY : ((row == 5) ? whiteY : ((row == 6) ? floorY : ((row == 7) ? colorY : ((row == 8) ? blowoutY : ((row == 9) ? softenY : smoothY)))))))));
+            if (row > 0) {
+                trackY -= rowShift;
+            }
+            if (row > 2) {
+                trackY -= curveShift;
+            }
+            float value = (row == 0) ? intensity : ((row == 1) ? expansionShape : ((row == 2) ? expansionScurve : ((row == 3) ? expansionMid : ((row == 4) ? highlightStretch : ((row == 5) ? stretchWhiteRef : ((row == 6) ? blackFloor : ((row == 7) ? colorIntensity : ((row == 8) ? highlightBlowout : ((row == 9) ? highlightSoftness : clamp(debandStrength, 0.0, 1.0))))))))));
+            if (row == 1 && splitCurveSliders < 0.5) {
+                value = expansionScurve;
+            }
             bool focus = abs(focused - float(row)) < 0.5;
 
             if (p.x >= x0 + 12.0 && p.x <= x0 + 126.0 && p.y >= trackY - 2.0 && p.y <= trackY + trackH + 2.0) {
-                vec3 lab = focus ? vec3(0.95, 0.85, 0.35) : vec3(0.75, 0.78, 0.82);
+                vec3 lab = focus ? vec3(0.95, 0.85, 0.35) : vec3(0.22, 0.24, 0.28);
                 outRgb = mix(outRgb, encodeHud(lab, nits * 0.7), 0.55);
             }
 
-            float textAlpha = drawLabelRow(p, vec2(x0 + 16.0, trackY + 1.0), labelScale, row);
+            float textAlpha = drawLabelRow(p, vec2(x0 + 16.0, trackY + 1.0), labelScale, row, splitCurveSliders);
             if (textAlpha > 0.01) {
-                vec3 textCol = focus ? vec3(0.08, 0.08, 0.10) : vec3(0.12, 0.12, 0.14);
+                vec3 textCol = focus ? vec3(0.08, 0.08, 0.10) : vec3(0.95, 0.95, 0.98);
                 outRgb = mix(outRgb, encodeHud(textCol, nits), clamp(textAlpha, 0.0, 1.0));
             }
 
             if (p.x >= trackX0 && p.x <= trackX1 && p.y >= trackY && p.y <= trackY + trackH) {
-                float t = (row == 2) ? clamp(value / 2.0, 0.0, 1.0) : clamp(value, 0.0, 1.0);
-                if (row == 5) {
+                float t = clamp(value, 0.0, 1.0);
+                if (row == 10) {
                     t = clamp(debandStrength, 0.0, 1.0);
                 }
                 float fillX = mix(trackX0, trackX1, t);
@@ -124,6 +200,12 @@ void main()
                 vec3 fill = focus ? vec3(0.95, 0.75, 0.20) : vec3(0.35, 0.70, 0.95);
                 vec3 col = (p.x <= fillX) ? fill : trackBg;
                 outRgb = encodeHud(col, nits * 0.85);
+            }
+
+            float valAlpha = drawSliderValue(p, vec2(trackX1 + 8.0, trackY + 1.0), labelScale, value);
+            if (valAlpha > 0.01) {
+                vec3 valCol = focus ? vec3(0.95, 0.85, 0.35) : vec3(0.95, 0.95, 0.98);
+                outRgb = mix(outRgb, encodeHud(valCol, nits), clamp(valAlpha, 0.0, 1.0));
             }
         }
         wrote = true;

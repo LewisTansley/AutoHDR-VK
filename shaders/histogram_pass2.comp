@@ -1,6 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
-// Single workgroup reduce: geo-mean, p05 (p10 slot), p25 (k1 slot), p90, near-max white (p98), GPU EMA.
+// Single workgroup reduce: geo-mean, p05 (p10 slot), p25 (k1 slot), p90–p98 CDF ladder, near-max (p100), GPU EMA.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer GlobalHistogram {
@@ -11,15 +12,19 @@ layout(std430, set = 0, binding = 1) buffer SceneStatsRW {
     float geoMean;
     float p10; // p05 content-floor candidate for raised-floor detect
     float p90;
-    float p98; // near-max content white (top bin with sufficient mass)
-    float k1;  // p25 bulk shadow for flatness detect
+    float p92;
+    float p94;
+    float p96;
+    float p98_cdf;
+    float nearMax; // p100 near-max content white (top bin with sufficient mass)
+    float k1;      // p25 bulk shadow for flatness detect
+    float contentWhite; // White-slider anchor (precomputed in pass2)
+    float stretchOut;   // Stretch ceiling toward 1.0 (precomputed in pass2)
+    float highlightGap; // nearMax - contentWhite
     float effectivePeak;
     float maxCLL;
     float maxFALL;
     uint initialized;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
 };
 
 layout(std140, set = 0, binding = 2) uniform AdaptParams {
@@ -30,8 +35,11 @@ layout(std140, set = 0, binding = 2) uniform AdaptParams {
     float adaptBrighten; // e.g. 0.25
     float adaptDarken;   // e.g. 0.05
     float temporalEnable;
-    float _pad;
+    float stretchWhiteRef;
+    float highlightStretch;
 };
+
+#include "histogram_stretch.glsl"
 
 shared uint binLocal[64];
 shared uint totalPixels;
@@ -73,17 +81,28 @@ void main()
         uint target05 = max(totalPixels / 20u, 1u);
         uint target25 = max(totalPixels / 4u, 1u);
         uint target90 = (totalPixels * 9u) / 10u;
+        uint target92 = (totalPixels * 92u) / 100u;
+        uint target94 = (totalPixels * 94u) / 100u;
+        uint target96 = (totalPixels * 96u) / 100u;
+        uint target98cdf = (totalPixels * 98u) / 100u;
         uint cum = 0u;
         float p05v = geo;
         float p25v = geo;
         float p90v = geo;
+        float p92v = geo;
+        float p94v = geo;
+        float p96v = geo;
+        float p98cdfv = geo;
         bool got05 = false;
         bool got25 = false;
         bool got90 = false;
+        bool got92 = false;
+        bool got94 = false;
+        bool got96 = false;
+        bool got98cdf = false;
         for (uint i = 0u; i < 64u; ++i) {
             cum += binLocal[i];
-            float u = (float(i) + 0.5) / 64.0;
-            float y = exp2(u * 10.0 - 10.0);
+            float y = histBinToY(i);
             if (!got05 && cum >= target05) {
                 p05v = y;
                 got05 = true;
@@ -95,18 +114,34 @@ void main()
             if (!got90 && cum >= target90) {
                 p90v = y;
                 got90 = true;
+            }
+            if (!got92 && cum >= target92) {
+                p92v = y;
+                got92 = true;
+            }
+            if (!got94 && cum >= target94) {
+                p94v = y;
+                got94 = true;
+            }
+            if (!got96 && cum >= target96) {
+                p96v = y;
+                got96 = true;
+            }
+            if (!got98cdf && cum >= target98cdf) {
+                p98cdfv = y;
+                got98cdf = true;
                 break;
             }
         }
 
         // Near-max content white: highest bin with enough mass (~top 0.0125%),
         // so sparse doorway/speculars define white instead of wall mass.
+        // Upper-edge decode so a filled top bin reports y = 1.0 (red bar can hit 100%).
         uint minMass = max(totalPixels / 8000u, 1u);
         float yMaxv = p90v;
         for (int i = 63; i >= 0; --i) {
             if (binLocal[i] >= minMass) {
-                float u = (float(i) + 0.5) / 64.0;
-                yMaxv = exp2(u * 10.0 - 10.0);
+                yMaxv = histBinToYPeak(uint(i));
                 break;
             }
         }
@@ -114,8 +149,7 @@ void main()
         if (yMaxv <= p90v + 1e-6) {
             for (int i = 63; i >= 0; --i) {
                 if (binLocal[i] >= 1u) {
-                    float u = (float(i) + 0.5) / 64.0;
-                    float y = exp2(u * 10.0 - 10.0);
+                    float y = histBinToYPeak(uint(i));
                     if (y > yMaxv) {
                         yMaxv = y;
                     }
@@ -133,23 +167,54 @@ void main()
         float p05Out = p05v;
         float p25Out = p25v;
         float p90Out = p90v;
+        float p92Out = p92v;
+        float p94Out = p94v;
+        float p96Out = p96v;
+        float p98cdfOut = p98cdfv;
         float yMaxOut = yMaxv;
         float peakOut = peakRaw;
+
+        float contentWhiteV = sampleHighlightLadder(stretchWhiteRef, p98cdfv, yMaxv);
+        contentWhiteV = clamp(max(contentWhiteV, 1e-3), 1e-3, 1.0);
+
+        float contentWhiteOut = contentWhiteV;
         if (temporalEnable > 0.5 && initialized != 0u) {
             geoOut = ema(geoMean, geo, geo > geoMean);
             p05Out = ema(p10, p05v, p05v > p10);
             p25Out = ema(k1, p25v, p25v > k1);
             p90Out = ema(p90, p90v, p90v > p90);
-            yMaxOut = ema(p98, yMaxv, yMaxv > p98);
+            p92Out = ema(p92, p92v, p92v > p92);
+            p94Out = ema(p94, p94v, p94v > p94);
+            p96Out = ema(p96, p96v, p96v > p96);
+            p98cdfOut = ema(p98_cdf, p98cdfv, p98cdfv > p98_cdf);
+            // Peak-friendly nearMax: rise fast so sparse speculars can fill the red bar;
+            // fall slowly so MaxCLL / white don't chatter.
+            float nearUp = max(adaptBrighten, 0.35);
+            float nearDown = max(adaptDarken, 0.05);
+            float nearA = (yMaxv > nearMax) ? nearUp : nearDown;
+            yMaxOut = mix(nearMax, yMaxv, clamp(nearA, 0.0, 1.0));
+            contentWhiteOut = ema(contentWhite, contentWhiteV, contentWhiteV > contentWhite);
         }
+
+        float stretchOutOut = contentWhiteOut;
+        float highlightGapOut = 0.0;
+        computeStretchTargets(contentWhiteOut, yMaxOut, geoOut, highlightStretch, stretchOutOut, highlightGapOut);
 
         geoMean = geoOut;
         p10 = p05Out;
         p90 = p90Out;
-        p98 = yMaxOut;
+        p92 = p92Out;
+        p94 = p94Out;
+        p96 = p96Out;
+        p98_cdf = p98cdfOut;
+        nearMax = yMaxOut;
         k1 = p25Out;
+        contentWhite = contentWhiteOut;
+        stretchOut = stretchOutOut;
+        highlightGap = highlightGapOut;
         effectivePeak = peakOut;
         maxFALL = geoOut * referenceNits;
+        // Trust sparse speculars: MaxCLL tracks nearMax so compositors/TVs keep full punch.
         maxCLL = yMaxOut * peakOut;
         initialized = 1u;
     }

@@ -59,7 +59,7 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     if (auto v = table["black_floor"].value<double>()) {
         settings.blackFloor = AutoHdr::clampBlackFloor(static_cast<float>(*v));
     } else if (auto v = table["black_point"].value<double>()) {
-        settings.blackFloor = AutoHdr::clampBlackFloor(static_cast<float>(*v) / 0.05f);
+        settings.blackFloor = AutoHdr::clampBlackFloor(static_cast<float>(*v) / 0.025f);
     }
     if (auto v = table["color_intensity"].value<double>()) {
         settings.colorIntensity = AutoHdr::clampColorIntensity(static_cast<float>(*v));
@@ -67,8 +67,26 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     if (auto v = table["expansion_shape"].value<double>()) {
         settings.expansionShape = AutoHdr::clampExpansionShape(static_cast<float>(*v));
     }
+    if (auto v = table["expansion_scurve"].value<double>()) {
+        settings.expansionScurve = AutoHdr::clampExpansionScurve(static_cast<float>(*v));
+    }
+    if (auto v = table["split_curve_sliders"].value<bool>()) {
+        settings.splitCurveSliders = *v;
+    }
+    if (auto v = table["expansion_mid"].value<double>()) {
+        settings.expansionMid = AutoHdr::clampExpansionMid(static_cast<float>(*v));
+    } else if (auto v = table["separation_mid"].value<double>()) {
+        // Legacy alias from the brief Sep-knee experiment this session.
+        settings.expansionMid = AutoHdr::clampExpansionMid(static_cast<float>(*v));
+    }
     if (auto v = table["highlight_stretch"].value<double>()) {
         settings.highlightStretch = AutoHdr::clampHighlightStretch(static_cast<float>(*v));
+    }
+    if (auto v = table["stretch_white_ref"].value<double>()) {
+        settings.stretchWhiteRef = AutoHdr::clampStretchWhiteRef(static_cast<float>(*v));
+    }
+    if (auto v = table["separation"].value<double>()) {
+        settings.separation = AutoHdr::clampSeparation(static_cast<float>(*v));
     }
     if (auto v = table["gamut_expansion"].value<double>()) {
         settings.gamutExpansion = AutoHdr::clampGamutExpansion(static_cast<float>(*v));
@@ -84,6 +102,9 @@ void applySettingsTable(const toml::table &table, AutoHdr::CalibrationSettings &
     }
     if (auto v = table["deband_strength"].value<double>()) {
         settings.debandStrength = AutoHdr::clampDebandStrength(static_cast<float>(*v));
+    }
+    if (auto v = table["highlight_blowout"].value<double>()) {
+        settings.highlightBlowout = AutoHdr::clampHighlightBlowout(static_cast<float>(*v));
     }
     if (auto v = table["perceptual_color"].value<bool>()) {
         settings.perceptualColor = *v;
@@ -110,11 +131,16 @@ void finalizeSettings(AutoHdr::CalibrationSettings &settings)
     settings.blackFloor = AutoHdr::clampBlackFloor(settings.blackFloor);
     settings.colorIntensity = AutoHdr::clampColorIntensity(settings.colorIntensity);
     settings.expansionShape = AutoHdr::clampExpansionShape(settings.expansionShape);
+    settings.expansionScurve = AutoHdr::clampExpansionScurve(settings.expansionScurve);
+    settings.expansionMid = AutoHdr::clampExpansionMid(settings.expansionMid);
     settings.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
+    settings.stretchWhiteRef = AutoHdr::clampStretchWhiteRef(settings.stretchWhiteRef);
+    settings.separation = AutoHdr::clampSeparation(settings.separation);
     settings.gamutExpansion = AutoHdr::clampGamutExpansion(settings.gamutExpansion);
     settings.highlightSoftness = AutoHdr::clampHighlightSoftness(settings.highlightSoftness);
     settings.ditherStrength = AutoHdr::clampDitherStrength(settings.ditherStrength);
     settings.debandStrength = AutoHdr::clampDebandStrength(settings.debandStrength);
+    settings.highlightBlowout = AutoHdr::clampHighlightBlowout(settings.highlightBlowout);
 
     if (settings.toneCurvePreset != AutoHdr::ToneCurvePreset::Custom) {
         AutoHdr::applyToneCurvePreset(settings);
@@ -294,10 +320,12 @@ AutoHdr::CalibrationSettings activeSettings()
 {
     std::lock_guard lock(g_configMutex);
     ensureLoaded();
+    AutoHdr::CalibrationSettings settings = g_config.global;
     if (const Profile *profile = matchingProfileLocked()) {
-        return profile->settings;
+        settings = profile->settings;
     }
-    return g_config.global;
+    AutoHdr::applyCoupledExpansion(settings);
+    return settings;
 }
 
 OutputEncoding activeEncoding()
@@ -324,8 +352,20 @@ bool wantPreferHdrSwapchain()
     return g_config.preferHdrSwapchain;
 }
 
-bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float blackFloor,
-                         float highlightStretch, float debandStrength)
+bool wantSwapchainRemap()
+{
+    std::lock_guard lock(g_configMutex);
+    ensureLoaded();
+    if (const char *noRemap = std::getenv("AUTOHDR_NO_SWAPCHAIN_REMAP"); noRemap && *noRemap
+        && std::string(noRemap) != "0") {
+        return false;
+    }
+    return g_config.preferHdrSwapchain;
+}
+
+bool saveOverlaySettings(float intensity, float colorIntensity, float expansionShape, float expansionScurve,
+                         float expansionMid, float blackFloor, float highlightStretch, float stretchWhiteRef,
+                         float separation, float highlightBlowout, float highlightSoftness, float debandStrength)
 {
     std::lock_guard lock(g_configMutex);
     ensureLoaded();
@@ -333,8 +373,14 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
     intensity = AutoHdr::clampIntensity(intensity);
     colorIntensity = AutoHdr::clampColorIntensity(colorIntensity);
     expansionShape = AutoHdr::clampExpansionShape(expansionShape);
+    expansionScurve = AutoHdr::clampExpansionScurve(expansionScurve);
+    expansionMid = AutoHdr::clampExpansionMid(expansionMid);
     blackFloor = AutoHdr::clampBlackFloor(blackFloor);
     highlightStretch = AutoHdr::clampHighlightStretch(highlightStretch);
+    stretchWhiteRef = AutoHdr::clampStretchWhiteRef(stretchWhiteRef);
+    separation = AutoHdr::clampSeparation(separation);
+    highlightBlowout = AutoHdr::clampHighlightBlowout(highlightBlowout);
+    highlightSoftness = AutoHdr::clampHighlightSoftness(highlightSoftness);
     debandStrength = AutoHdr::clampDebandStrength(debandStrength);
 
     // Update in-memory first so subsequent activeSettings() sees the new values.
@@ -342,15 +388,27 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
         profile->settings.intensity = intensity;
         profile->settings.colorIntensity = colorIntensity;
         profile->settings.expansionShape = expansionShape;
+        profile->settings.expansionScurve = expansionScurve;
+        profile->settings.expansionMid = expansionMid;
         profile->settings.blackFloor = blackFloor;
         profile->settings.highlightStretch = highlightStretch;
+        profile->settings.stretchWhiteRef = stretchWhiteRef;
+        profile->settings.separation = separation;
+        profile->settings.highlightBlowout = highlightBlowout;
+        profile->settings.highlightSoftness = highlightSoftness;
         profile->settings.debandStrength = debandStrength;
     } else {
         g_config.global.intensity = intensity;
         g_config.global.colorIntensity = colorIntensity;
         g_config.global.expansionShape = expansionShape;
+        g_config.global.expansionScurve = expansionScurve;
+        g_config.global.expansionMid = expansionMid;
         g_config.global.blackFloor = blackFloor;
         g_config.global.highlightStretch = highlightStretch;
+        g_config.global.stretchWhiteRef = stretchWhiteRef;
+        g_config.global.separation = separation;
+        g_config.global.highlightBlowout = highlightBlowout;
+        g_config.global.highlightSoftness = highlightSoftness;
         g_config.global.debandStrength = debandStrength;
     }
 
@@ -386,8 +444,14 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table->insert_or_assign("intensity", static_cast<double>(intensity));
                 table->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
                 table->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+                table->insert_or_assign("expansion_scurve", static_cast<double>(expansionScurve));
+                table->insert_or_assign("expansion_mid", static_cast<double>(expansionMid));
                 table->insert_or_assign("black_floor", static_cast<double>(blackFloor));
                 table->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
+                table->insert_or_assign("stretch_white_ref", static_cast<double>(stretchWhiteRef));
+                table->insert_or_assign("separation", static_cast<double>(separation));
+                table->insert_or_assign("highlight_blowout", static_cast<double>(highlightBlowout));
+                table->insert_or_assign("highlight_softness", static_cast<double>(highlightSoftness));
                 table->insert_or_assign("deband_strength", static_cast<double>(debandStrength));
                 updated = true;
                 break;
@@ -398,8 +462,14 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
                 table.insert("intensity", static_cast<double>(intensity));
                 table.insert("color_intensity", static_cast<double>(colorIntensity));
                 table.insert("expansion_shape", static_cast<double>(expansionShape));
+                table.insert("expansion_scurve", static_cast<double>(expansionScurve));
+                table.insert("expansion_mid", static_cast<double>(expansionMid));
                 table.insert("black_floor", static_cast<double>(blackFloor));
                 table.insert("highlight_stretch", static_cast<double>(highlightStretch));
+                table.insert("stretch_white_ref", static_cast<double>(stretchWhiteRef));
+                table.insert("separation", static_cast<double>(separation));
+                table.insert("highlight_blowout", static_cast<double>(highlightBlowout));
+                table.insert("highlight_softness", static_cast<double>(highlightSoftness));
                 table.insert("deband_strength", static_cast<double>(debandStrength));
                 arr->push_back(std::move(table));
             }
@@ -412,8 +482,14 @@ bool saveOverlaySettings(float intensity, float colorIntensity, float expansionS
             global->insert_or_assign("intensity", static_cast<double>(intensity));
             global->insert_or_assign("color_intensity", static_cast<double>(colorIntensity));
             global->insert_or_assign("expansion_shape", static_cast<double>(expansionShape));
+            global->insert_or_assign("expansion_scurve", static_cast<double>(expansionScurve));
+            global->insert_or_assign("expansion_mid", static_cast<double>(expansionMid));
             global->insert_or_assign("black_floor", static_cast<double>(blackFloor));
             global->insert_or_assign("highlight_stretch", static_cast<double>(highlightStretch));
+            global->insert_or_assign("stretch_white_ref", static_cast<double>(stretchWhiteRef));
+            global->insert_or_assign("separation", static_cast<double>(separation));
+            global->insert_or_assign("highlight_blowout", static_cast<double>(highlightBlowout));
+            global->insert_or_assign("highlight_softness", static_cast<double>(highlightSoftness));
             global->insert_or_assign("deband_strength", static_cast<double>(debandStrength));
         }
 

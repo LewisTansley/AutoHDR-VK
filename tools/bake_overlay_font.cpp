@@ -1,4 +1,4 @@
-// Build-time tool: bake DejaVu Sans A–Z into an RGBA atlas + GLSL glyph metrics.
+// Build-time tool: bake DejaVu Sans A–Z and 0–9 into an RGBA atlas + GLSL glyph metrics.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -15,7 +15,7 @@ namespace {
 constexpr int kAtlasWidth = 512;
 constexpr int kAtlasHeight = 64;
 constexpr float kFontSize = 18.0f;
-constexpr int kGlyphCount = 26;
+constexpr int kGlyphCount = 36; // A–Z (0..25), then 0–9 (26..35)
 
 struct GlyphRect {
     int x0 = 0;
@@ -67,7 +67,8 @@ bool writeMetricsGlsl(const std::filesystem::path &path, const GlyphRect glyphs[
     out << "    vec4 uv;     // u0, v0, u1, v1\n";
     out << "    float advance;\n";
     out << "};\n\n";
-    out << "const OverlayGlyph kOverlayGlyphs[26] = OverlayGlyph[](\n";
+    out << "const int kOverlayGlyphCount = " << kGlyphCount << ";\n";
+    out << "const OverlayGlyph kOverlayGlyphs[" << kGlyphCount << "] = OverlayGlyph[](\n";
     for (int i = 0; i < kGlyphCount; ++i) {
         const GlyphRect &g = glyphs[i];
         const float u0 = static_cast<float>(g.x0) / static_cast<float>(kAtlasWidth);
@@ -82,15 +83,12 @@ bool writeMetricsGlsl(const std::filesystem::path &path, const GlyphRect glyphs[
     return true;
 }
 
-int glyphIndex(char c)
+char glyphChar(int index)
 {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A';
+    if (index < 26) {
+        return static_cast<char>('A' + index);
     }
-    if (c >= 'a' && c <= 'z') {
-        return c - 'a';
-    }
-    return -1;
+    return static_cast<char>('0' + (index - 26));
 }
 
 } // namespace
@@ -131,7 +129,7 @@ int main(int argc, char **argv)
     int penX = 2;
 
     for (int i = 0; i < kGlyphCount; ++i) {
-        const char ch = static_cast<char>('A' + i);
+        const char ch = glyphChar(i);
         int advance = 0;
         int lsb = 0;
         stbtt_GetCodepointHMetrics(&font, ch, &advance, &lsb);

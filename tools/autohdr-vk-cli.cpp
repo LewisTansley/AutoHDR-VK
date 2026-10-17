@@ -19,6 +19,12 @@ int main(int argc, char **argv)
                   "  DISABLE_AUTOHDR=1      force off\n"
                   "  AUTOHDR_CONFIG=path    override config file\n"
                   "  AUTOHDR_LOG=1          layer stderr logging\n"
+                  "  AUTOHDR_SHOW_INTENSITY=1\n"
+                  "                         show the overlay Intensity slider\n"
+                  "                         (otherwise the effect uses intensity 1.0)\n"
+                  "  AUTOHDR_SHOW_FINISHING=1\n"
+                  "                         show the overlay Soften and Smooth sliders\n"
+                  "                         (otherwise the effect uses 1.0 for both)\n"
                   "\n"
                   "Config: ~/.config/autohdr-vk/conf.toml");
         return 0;
@@ -35,12 +41,18 @@ int main(int argc, char **argv)
     std::cout << "black_point:    " << settings.blackPoint << '\n';
     std::cout << "black_floor:    " << settings.blackFloor << '\n';
     std::cout << "highlight_stretch:" << settings.highlightStretch << '\n';
+    std::cout << "stretch_white_ref:" << settings.stretchWhiteRef << '\n';
+    std::cout << "separation:     " << settings.separation << '\n';
     std::cout << "color_intensity:" << settings.colorIntensity << '\n';
     std::cout << "expansion_shape:" << settings.expansionShape << '\n';
+    std::cout << "expansion_scurve:" << settings.expansionScurve << '\n';
+    std::cout << "split_curve_sliders:" << (settings.splitCurveSliders ? "yes" : "no") << '\n';
+    std::cout << "expansion_mid:  " << settings.expansionMid << '\n';
     std::cout << "gamut_expansion:" << settings.gamutExpansion << '\n';
     std::cout << "dither:         " << (settings.dither ? "yes" : "no") << '\n';
     std::cout << "dither_strength:" << settings.ditherStrength << '\n';
     std::cout << "deband_strength:" << settings.debandStrength << '\n';
+    std::cout << "highlight_blowout:" << settings.highlightBlowout << '\n';
     std::cout << "tone_curve:     " << AutoHdr::presetToString(settings.toneCurvePreset) << '\n';
     std::cout << "curve_points:   " << AutoHdr::formatToneCurvePoints(settings.toneCurvePoints) << '\n';
     std::cout << "sdr_max_point:  " << AutoHdr::formatSdrMaxPoint(settings.sdrMaxPoint) << '\n';

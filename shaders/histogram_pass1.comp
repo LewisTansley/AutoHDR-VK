@@ -48,9 +48,9 @@ void main()
         // here rgb is linear display-referred ~[0,1].
         float y = max(luminance(rgb), 1e-6);
         float logY = log2(y);
-        // Map log2(y) from ~[-10, 0] into 64 bins
+        // Map log2(y) from ~[-10, 0] into 64 equal-width bins (top bin includes y≈1).
         float u = clamp((logY + 10.0) / 10.0, 0.0, 1.0);
-        uint bin = min(uint(u * 63.0), 63u);
+        uint bin = min(uint(u * 64.0), 63u);
         atomicAdd(localHistogram[bin], 1u);
     }
     barrier();

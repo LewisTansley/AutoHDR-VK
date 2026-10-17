@@ -23,8 +23,11 @@ layout(std140, set = 0, binding = 3) uniform ToneParams {
     float outputMode; // 0=pq, 1=scrgb, 2=sdr preview
     float inputIsSrgb;
     float intensity;
-    float highlightStretch;
     float debandStrength; // 0 = off, 1 = max (SMOOTH slider)
+    float highlightBlowout; // BLOWOUT slider: RenoDX-style highlight desat (0 = off)
+    float separation; // SEP slider: Ultra HDR–style highlight punch weight (0 = off)
+    float highlightStretch; // STRETCH slider: blend weight for highlight remap (0 = off)
+    float _padTone2;
     vec4 pqBoostParams;
     uvec2 extent;
     uint outputBits; // 8 / 10 / 16 — swapchain quantization depth
@@ -35,15 +38,19 @@ layout(std430, set = 0, binding = 5) readonly buffer SceneStatsBlock {
     float geoMean;
     float p10;
     float p90;
-    float p98;
+    float p92;
+    float p94;
+    float p96;
+    float p98_cdf;
+    float nearMax;
     float k1;
+    float contentWhite;
+    float stretchOut;
+    float highlightGap;
     float effectivePeak;
     float maxCLL;
     float maxFALL;
     uint initialized;
-    uint _pad0s;
-    uint _pad1s;
-    uint _pad2s;
 } sceneStats;
 
 #include "tonemap_color.glsl"
@@ -69,10 +76,19 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
 
     float rawLumaNits = max(luminanceYNits(rgbNits), 1e-6);
     float yRel = rawLumaNits / ref;
+    float sepMid = 0.18;
+    float sepHi = 0.55;
     if (sceneStats.initialized != 0u) {
-        yRel = adaptContentRange(yRel, sceneStats.p10, sceneStats.k1, sceneStats.p98, sceneStats.geoMean,
-                                 highlightStretch);
+        float shadowFloor = max(sceneStats.k1, sceneStats.geoMean * 1.05);
+        float yPre = yRel;
+        float remapped = applyStretchRemap(yPre, shadowFloor, sceneStats.contentWhite, sceneStats.stretchOut);
+        float w = clamp(highlightStretch, 0.0, 1.0);
+        w *= w; // soft engage — match pass2 ease
+        yRel = mix(yPre, remapped, w);
+        sepMid = max(sceneStats.geoMean, sceneStats.k1);
+        sepHi = max(sceneStats.contentWhite, sepMid + 1e-3);
     }
+    yRel = applySeparationBoost(yRel, sepMid, sepHi, separation);
     float curveInputNits = applyUserBlackPoint(yRel, blackPoint) * ref;
     float outputNits = mapToneCurve(curveInputNits, curveSpan);
 
@@ -85,6 +101,7 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
         if (effectiveGamut > 0.0) {
             rgbNits = expandGamutSmart(rgbNits / ref, effectiveGamut) * ref;
         }
+        rgbNits = applyHighlightBlowout(rgbNits, displayPeak, highlightBlowout);
         vec3 xyz = autohdrRec709ToXYZ(rgbNits);
         float outY = max(xyz.y, 1e-6);
         float limitedY = applyHighlightPeakLimit(outY, displayPeak, highlightSoftness);
@@ -95,6 +112,7 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
         if (effectiveGamut > 0.0) {
             rgbNits = expandGamutSmart(rgbNits / ref, effectiveGamut) * ref;
         }
+        rgbNits = applyHighlightBlowout(rgbNits, displayPeak, highlightBlowout);
         float outLuma = dot(rgbNits, AUTOHDR_LUMA);
         float limitedLuma = applyHighlightPeakLimit(outLuma, displayPeak, highlightSoftness);
         rgbNits *= limitedLuma / max(outLuma, 1e-6);

@@ -16,6 +16,8 @@
 #include "ui_cluster.comp.spv.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -462,37 +464,53 @@ const char *presentPathLabel(const DeviceData *dev, const SwapchainData &sc, con
     return "blit";
 }
 
-void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat,
-                      bool presentUsesCompute)
+void uploadToneParams(DeviceData *dev, SwapchainImageResources &res, const AutoHdr::CalibrationSettings &settings,
+                      OutputEncoding encoding, bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent,
+                      VkFormat swapFormat, bool presentUsesCompute)
 {
-    if (!dev->uboMapped || !dev->lutMapped) {
+    if (!res.uboMapped || !res.lutMapped) {
         return;
     }
 
-    const float intensity = std::clamp(settings.intensity, 0.0f, 1.0f);
-
-    AutoHdr::ToneCurveEndpoints endpoints;
-    endpoints.peakNits = settings.maxNits;
-    endpoints.visualReferenceNits = settings.referenceNits;
-    endpoints.sdrMaxPoint = settings.sdrMaxPoint.x > 0.0f ? settings.sdrMaxPoint
-                                                          : AutoHdr::Vec2{settings.referenceNits, settings.maxNits};
-
-    // expansion_shape drives the live LUT (linear→exponential morph); overrides static preset points.
-    AutoHdr::PresetCurveParams shapeParams;
-    shapeParams.referenceNits = settings.referenceNits;
-    shapeParams.peakNits = settings.maxNits;
+    const float intensity = AutoHdr::intensityToBlend(settings.intensity);
     const float shape = AutoHdr::clampExpansionShape(settings.expansionShape);
-    const auto intermediates = AutoHdr::generateExpansionShapePoints(shape, shapeParams);
-    const auto full = AutoHdr::buildFullCurve(endpoints, intermediates);
-    const float span = std::max(endpoints.sdrMaxPoint.x, settings.referenceNits);
-    float lut[AutoHdr::kToneCurveLutSize];
-    AutoHdr::buildToneCurveLut(full, span, lut, AutoHdr::kToneCurveLutSize);
-    float packed[AutoHdr::kToneCurveLutSize];
-    for (int i = 0; i < AutoHdr::kToneCurveLutSize; ++i) {
-        packed[i] = lut[i];
+    const float scurve = AutoHdr::clampExpansionScurve(settings.expansionScurve);
+    const float mid = AutoHdr::clampExpansionMid(settings.expansionMid);
+    const float ref = settings.referenceNits;
+    const float peak = settings.maxNits;
+
+    const bool lutNeedsRebuild = !dev->cachedLutValid || shape != dev->cachedLutShape || scurve != dev->cachedLutScurve
+        || mid != dev->cachedLutMid || ref != dev->cachedLutRef || peak != dev->cachedLutPeak;
+
+    float span = std::max(ref, 1e-3f);
+    if (lutNeedsRebuild) {
+        AutoHdr::ToneCurveEndpoints endpoints;
+        endpoints.peakNits = peak;
+        endpoints.visualReferenceNits = ref;
+        endpoints.sdrMaxPoint = settings.sdrMaxPoint.x > 0.0f ? settings.sdrMaxPoint : AutoHdr::Vec2{ref, peak};
+
+        AutoHdr::PresetCurveParams shapeParams;
+        shapeParams.referenceNits = ref;
+        shapeParams.peakNits = peak;
+        const auto intermediates = AutoHdr::generateExpansionShapePoints(shape, scurve, mid, shapeParams);
+        const auto full = AutoHdr::buildFullCurve(endpoints, intermediates);
+        span = std::max(endpoints.sdrMaxPoint.x, ref);
+        AutoHdr::buildToneCurveLut(full, span, dev->cachedLut, AutoHdr::kToneCurveLutSize);
+        dev->cachedLutShape = shape;
+        dev->cachedLutScurve = scurve;
+        dev->cachedLutMid = mid;
+        dev->cachedLutRef = ref;
+        dev->cachedLutPeak = peak;
+        dev->cachedLutValid = true;
+    } else {
+        AutoHdr::ToneCurveEndpoints endpoints;
+        endpoints.peakNits = peak;
+        endpoints.visualReferenceNits = ref;
+        endpoints.sdrMaxPoint = settings.sdrMaxPoint.x > 0.0f ? settings.sdrMaxPoint : AutoHdr::Vec2{ref, peak};
+        span = std::max(endpoints.sdrMaxPoint.x, ref);
     }
-    std::memcpy(dev->lutMapped, packed, sizeof(packed));
+
+    std::memcpy(res.lutMapped, dev->cachedLut, sizeof(dev->cachedLut));
 
     uint32_t outputBits = outputBitsForSwapFormat(swapFormat);
 
@@ -508,8 +526,10 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.perceptualColorEnabled = settings.perceptualColor ? 1.0f : 0.0f;
     ubo.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
     ubo.intensity = intensity;
-    ubo.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
     ubo.debandStrength = AutoHdr::clampDebandStrength(settings.debandStrength);
+    ubo.highlightBlowout = AutoHdr::clampHighlightBlowout(settings.highlightBlowout);
+    ubo.separation = AutoHdr::clampSeparation(settings.separation);
+    ubo.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
     switch (encoding) {
     case OutputEncoding::LinearScRgb:
         ubo.outputMode = 1.0f;
@@ -530,55 +550,57 @@ void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &setti
     ubo.extentHeight = extent.height;
     ubo.outputBits = outputBits;
     ubo.presentUsesCompute = presentUsesCompute ? 1u : 0u;
-    std::memcpy(dev->uboMapped, &ubo, sizeof(ubo));
+    std::memcpy(res.uboMapped, &ubo, sizeof(ubo));
 
-    if (dev->histParamsMapped) {
+    if (res.histParamsMapped) {
         HistParamsUBO histParams{};
         histParams.extentWidth = extent.width;
         histParams.extentHeight = extent.height;
         histParams.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
         histParams.referenceNits = settings.referenceNits;
-        std::memcpy(dev->histParamsMapped, &histParams, sizeof(histParams));
+        std::memcpy(res.histParamsMapped, &histParams, sizeof(histParams));
     }
 
-    if (dev->adaptParamsMapped) {
+    if (res.adaptParamsMapped) {
         AdaptParamsUBO adaptParams{};
         adaptParams.intensity = intensity;
         adaptParams.referenceNits = settings.referenceNits;
         adaptParams.peakNits = settings.maxNits;
         adaptParams.sdrWhiteNits = 80.0f;
-        // Temporal smoothing for geo-mean / p10 / p90 / p98 / k1 scene stats.
+        // Temporal smoothing for geo-mean / p10 / p90–p98 ladder / nearMax / k1 scene stats.
         adaptParams.adaptBrighten = 0.010f;
         adaptParams.adaptDarken = 0.015f;
         adaptParams.temporalEnable = 1.0f;
-        std::memcpy(dev->adaptParamsMapped, &adaptParams, sizeof(adaptParams));
+        adaptParams.stretchWhiteRef = AutoHdr::clampStretchWhiteRef(settings.stretchWhiteRef);
+        adaptParams.highlightStretch = AutoHdr::clampHighlightStretch(settings.highlightStretch);
+        std::memcpy(res.adaptParamsMapped, &adaptParams, sizeof(adaptParams));
     }
 
-    if (dev->uiParamsMapped) {
+    if (res.uiParamsMapped) {
         UiParamsUBO uiParams{};
         uiParams.extentWidth = extent.width;
         uiParams.extentHeight = extent.height;
         uiParams.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
-        std::memcpy(dev->uiParamsMapped, &uiParams, sizeof(uiParams));
+        std::memcpy(res.uiParamsMapped, &uiParams, sizeof(uiParams));
     }
 
-    if (dev->blurParamsMapped) {
+    if (res.blurParamsMapped) {
         BlurParamsUBO blurParams{};
         blurParams.fullW = extent.width;
         blurParams.fullH = extent.height;
         blurParams.halfW = halfExtent.width;
         blurParams.halfH = halfExtent.height;
         blurParams.inputIsSrgb = inputIsSrgb ? 1.0f : 0.0f;
-        std::memcpy(dev->blurParamsMapped, &blurParams, sizeof(blurParams));
+        std::memcpy(res.blurParamsMapped, &blurParams, sizeof(blurParams));
     }
 }
 
-void uploadOverlayParams(DeviceData *dev, const OverlayParamsUBO &params)
+void uploadOverlayParams(SwapchainImageResources &res, const OverlayParamsUBO &params)
 {
-    if (!dev->overlayParamsMapped) {
+    if (!res.overlayParamsMapped) {
         return;
     }
-    std::memcpy(dev->overlayParamsMapped, &params, sizeof(params));
+    std::memcpy(res.overlayParamsMapped, &params, sizeof(params));
 }
 
 void destroyDeviceResources(DeviceData *dev)
@@ -688,102 +710,6 @@ void destroyDeviceResources(DeviceData *dev)
         d.DestroyDescriptorPool(dev->device, dev->descriptorPool, nullptr);
         dev->descriptorPool = VK_NULL_HANDLE;
     }
-    if (dev->uboMapped) {
-        d.UnmapMemory(dev->device, dev->uboMemory);
-        dev->uboMapped = nullptr;
-    }
-    if (dev->uboBuffer) {
-        d.DestroyBuffer(dev->device, dev->uboBuffer, nullptr);
-        dev->uboBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->uboMemory) {
-        d.FreeMemory(dev->device, dev->uboMemory, nullptr);
-        dev->uboMemory = VK_NULL_HANDLE;
-    }
-    if (dev->lutMapped) {
-        d.UnmapMemory(dev->device, dev->lutMemory);
-        dev->lutMapped = nullptr;
-    }
-    if (dev->lutBuffer) {
-        d.DestroyBuffer(dev->device, dev->lutBuffer, nullptr);
-        dev->lutBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->lutMemory) {
-        d.FreeMemory(dev->device, dev->lutMemory, nullptr);
-        dev->lutMemory = VK_NULL_HANDLE;
-    }
-    if (dev->histParamsMapped) {
-        d.UnmapMemory(dev->device, dev->histParamsMemory);
-        dev->histParamsMapped = nullptr;
-    }
-    if (dev->histParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->histParamsBuffer, nullptr);
-        dev->histParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->histParamsMemory) {
-        d.FreeMemory(dev->device, dev->histParamsMemory, nullptr);
-        dev->histParamsMemory = VK_NULL_HANDLE;
-    }
-    if (dev->adaptParamsMapped) {
-        d.UnmapMemory(dev->device, dev->adaptParamsMemory);
-        dev->adaptParamsMapped = nullptr;
-    }
-    if (dev->adaptParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->adaptParamsBuffer, nullptr);
-        dev->adaptParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->adaptParamsMemory) {
-        d.FreeMemory(dev->device, dev->adaptParamsMemory, nullptr);
-        dev->adaptParamsMemory = VK_NULL_HANDLE;
-    }
-    if (dev->uiParamsMapped) {
-        d.UnmapMemory(dev->device, dev->uiParamsMemory);
-        dev->uiParamsMapped = nullptr;
-    }
-    if (dev->uiParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->uiParamsBuffer, nullptr);
-        dev->uiParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->uiParamsMemory) {
-        d.FreeMemory(dev->device, dev->uiParamsMemory, nullptr);
-        dev->uiParamsMemory = VK_NULL_HANDLE;
-    }
-    if (dev->blurParamsMapped) {
-        d.UnmapMemory(dev->device, dev->blurParamsMemory);
-        dev->blurParamsMapped = nullptr;
-    }
-    if (dev->blurParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->blurParamsBuffer, nullptr);
-        dev->blurParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->blurParamsMemory) {
-        d.FreeMemory(dev->device, dev->blurParamsMemory, nullptr);
-        dev->blurParamsMemory = VK_NULL_HANDLE;
-    }
-    if (dev->overlayParamsMapped) {
-        d.UnmapMemory(dev->device, dev->overlayParamsMemory);
-        dev->overlayParamsMapped = nullptr;
-    }
-    if (dev->overlayParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->overlayParamsBuffer, nullptr);
-        dev->overlayParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->overlayParamsMemory) {
-        d.FreeMemory(dev->device, dev->overlayParamsMemory, nullptr);
-        dev->overlayParamsMemory = VK_NULL_HANDLE;
-    }
-    if (dev->presentParamsMapped) {
-        d.UnmapMemory(dev->device, dev->presentParamsMemory);
-        dev->presentParamsMapped = nullptr;
-    }
-    if (dev->presentParamsBuffer) {
-        d.DestroyBuffer(dev->device, dev->presentParamsBuffer, nullptr);
-        dev->presentParamsBuffer = VK_NULL_HANDLE;
-    }
-    if (dev->presentParamsMemory) {
-        d.FreeMemory(dev->device, dev->presentParamsMemory, nullptr);
-        dev->presentParamsMemory = VK_NULL_HANDLE;
-    }
     if (dev->overlayFontView) {
         d.DestroyImageView(dev->device, dev->overlayFontView, nullptr);
         dev->overlayFontView = VK_NULL_HANDLE;
@@ -815,6 +741,7 @@ void destroyDeviceResources(DeviceData *dev)
         d.DestroyCommandPool(dev->device, dev->commandPool, nullptr);
         dev->commandPool = VK_NULL_HANDLE;
     }
+    dev->cachedLutValid = false;
     dev->pipelineReady = false;
 }
 
@@ -854,41 +781,7 @@ bool ensureDeviceResources(DeviceData *dev)
         return false;
     }
 
-    if (!createHostBuffer(dev, sizeof(ToneParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->uboBuffer,
-                          dev->uboMemory, &dev->uboMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(float) * AutoHdr::kToneCurveLutSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                          dev->lutBuffer, dev->lutMemory, &dev->lutMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(HistParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->histParamsBuffer,
-                          dev->histParamsMemory, &dev->histParamsMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(AdaptParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->adaptParamsBuffer,
-                          dev->adaptParamsMemory, &dev->adaptParamsMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(UiParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->uiParamsBuffer,
-                          dev->uiParamsMemory, &dev->uiParamsMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(BlurParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->blurParamsBuffer,
-                          dev->blurParamsMemory, &dev->blurParamsMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(OverlayParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->overlayParamsBuffer,
-                          dev->overlayParamsMemory, &dev->overlayParamsMapped)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(PresentParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, dev->presentParamsBuffer,
-                          dev->presentParamsMemory, &dev->presentParamsMapped)) {
-        return false;
-    }
-
     {
-        // Legacy color tonemap: input, ToneLut, mask, ToneParams, storage out, SceneStats
         VkDescriptorSetLayoutBinding bindings[6]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1187,51 +1080,6 @@ void destroySwapchainResources(DeviceData *dev, SwapchainData &sc)
 {
     auto &d = dev->dispatch;
 
-    if (sc.sceneStatsMapped) {
-        d.UnmapMemory(dev->device, sc.sceneStatsMemory);
-        sc.sceneStatsMapped = nullptr;
-    }
-    if (sc.sceneStatsBuffer) {
-        d.DestroyBuffer(dev->device, sc.sceneStatsBuffer, nullptr);
-        sc.sceneStatsBuffer = VK_NULL_HANDLE;
-    }
-    if (sc.sceneStatsMemory) {
-        d.FreeMemory(dev->device, sc.sceneStatsMemory, nullptr);
-        sc.sceneStatsMemory = VK_NULL_HANDLE;
-    }
-    if (sc.histBuffer) {
-        d.DestroyBuffer(dev->device, sc.histBuffer, nullptr);
-        sc.histBuffer = VK_NULL_HANDLE;
-    }
-    if (sc.histMemory) {
-        d.FreeMemory(dev->device, sc.histMemory, nullptr);
-        sc.histMemory = VK_NULL_HANDLE;
-    }
-    if (sc.baseView) {
-        d.DestroyImageView(dev->device, sc.baseView, nullptr);
-        sc.baseView = VK_NULL_HANDLE;
-    }
-    if (sc.baseImage) {
-        d.DestroyImage(dev->device, sc.baseImage, nullptr);
-        sc.baseImage = VK_NULL_HANDLE;
-    }
-    if (sc.baseMemory) {
-        d.FreeMemory(dev->device, sc.baseMemory, nullptr);
-        sc.baseMemory = VK_NULL_HANDLE;
-    }
-    if (sc.maskView) {
-        d.DestroyImageView(dev->device, sc.maskView, nullptr);
-        sc.maskView = VK_NULL_HANDLE;
-    }
-    if (sc.maskImage) {
-        d.DestroyImage(dev->device, sc.maskImage, nullptr);
-        sc.maskImage = VK_NULL_HANDLE;
-    }
-    if (sc.maskMemory) {
-        d.FreeMemory(dev->device, sc.maskMemory, nullptr);
-        sc.maskMemory = VK_NULL_HANDLE;
-    }
-
     for (auto &img : sc.images) {
         if (img.fence) {
             d.WaitForFences(dev->device, 1, &img.fence, VK_TRUE, UINT64_MAX);
@@ -1274,6 +1122,82 @@ void destroySwapchainResources(DeviceData *dev, SwapchainData &sc)
             d.DestroyImageView(dev->device, img.swapStorageView, nullptr);
             img.swapStorageView = VK_NULL_HANDLE;
         }
+        if (img.baseView) {
+            d.DestroyImageView(dev->device, img.baseView, nullptr);
+            img.baseView = VK_NULL_HANDLE;
+        }
+        if (img.baseImage) {
+            d.DestroyImage(dev->device, img.baseImage, nullptr);
+            img.baseImage = VK_NULL_HANDLE;
+        }
+        if (img.baseMemory) {
+            d.FreeMemory(dev->device, img.baseMemory, nullptr);
+            img.baseMemory = VK_NULL_HANDLE;
+        }
+        if (img.maskView) {
+            d.DestroyImageView(dev->device, img.maskView, nullptr);
+            img.maskView = VK_NULL_HANDLE;
+        }
+        if (img.maskImage) {
+            d.DestroyImage(dev->device, img.maskImage, nullptr);
+            img.maskImage = VK_NULL_HANDLE;
+        }
+        if (img.maskMemory) {
+            d.FreeMemory(dev->device, img.maskMemory, nullptr);
+            img.maskMemory = VK_NULL_HANDLE;
+        }
+        if (img.histBuffer) {
+            d.DestroyBuffer(dev->device, img.histBuffer, nullptr);
+            img.histBuffer = VK_NULL_HANDLE;
+        }
+        if (img.histMemory) {
+            d.FreeMemory(dev->device, img.histMemory, nullptr);
+            img.histMemory = VK_NULL_HANDLE;
+        }
+        if (img.sceneStatsBuffer) {
+            d.DestroyBuffer(dev->device, img.sceneStatsBuffer, nullptr);
+            img.sceneStatsBuffer = VK_NULL_HANDLE;
+        }
+        if (img.sceneStatsMemory) {
+            d.FreeMemory(dev->device, img.sceneStatsMemory, nullptr);
+            img.sceneStatsMemory = VK_NULL_HANDLE;
+        }
+        if (img.sceneStatsStagingMapped) {
+            d.UnmapMemory(dev->device, img.sceneStatsStagingMemory);
+            img.sceneStatsStagingMapped = nullptr;
+        }
+        if (img.sceneStatsStaging) {
+            d.DestroyBuffer(dev->device, img.sceneStatsStaging, nullptr);
+            img.sceneStatsStaging = VK_NULL_HANDLE;
+        }
+        if (img.sceneStatsStagingMemory) {
+            d.FreeMemory(dev->device, img.sceneStatsStagingMemory, nullptr);
+            img.sceneStatsStagingMemory = VK_NULL_HANDLE;
+        }
+
+        auto destroyMapped = [&](VkBuffer &buf, VkDeviceMemory &mem, void *&mapped) {
+            if (mapped) {
+                d.UnmapMemory(dev->device, mem);
+                mapped = nullptr;
+            }
+            if (buf) {
+                d.DestroyBuffer(dev->device, buf, nullptr);
+                buf = VK_NULL_HANDLE;
+            }
+            if (mem) {
+                d.FreeMemory(dev->device, mem, nullptr);
+                mem = VK_NULL_HANDLE;
+            }
+        };
+        destroyMapped(img.lutBuffer, img.lutMemory, img.lutMapped);
+        destroyMapped(img.uboBuffer, img.uboMemory, img.uboMapped);
+        destroyMapped(img.histParamsBuffer, img.histParamsMemory, img.histParamsMapped);
+        destroyMapped(img.adaptParamsBuffer, img.adaptParamsMemory, img.adaptParamsMapped);
+        destroyMapped(img.uiParamsBuffer, img.uiParamsMemory, img.uiParamsMapped);
+        destroyMapped(img.blurParamsBuffer, img.blurParamsMemory, img.blurParamsMapped);
+        destroyMapped(img.overlayParamsBuffer, img.overlayParamsMemory, img.overlayParamsMapped);
+        destroyMapped(img.presentParamsBuffer, img.presentParamsMemory, img.presentParamsMapped);
+
         img.tonemapSet = VK_NULL_HANDLE;
         img.histPass1Set = VK_NULL_HANDLE;
         img.histPass2Set = VK_NULL_HANDLE;
@@ -1281,10 +1205,15 @@ void destroySwapchainResources(DeviceData *dev, SwapchainData &sc)
         img.baseBlurSet = VK_NULL_HANDLE;
         img.overlaySet = VK_NULL_HANDLE;
         img.presentSet = VK_NULL_HANDLE;
+        img.maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        img.baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     sc.images.clear();
-    sc.maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    sc.baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    sc.latestCpuStatsValid = false;
+    sc.lastMetaMaxCLL = -1.0f;
+    sc.lastMetaMaxFALL = -1.0f;
+    sc.lastMetaPeak = -1.0f;
+    sc.lastMetaNs = 0;
     sc.active = false;
 }
 
@@ -1297,34 +1226,10 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
 
     auto &d = dev->dispatch;
 
-    if (!createDeviceBuffer(dev, kHistBufferSize,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, sc.histBuffer,
-                            sc.histMemory)) {
-        return false;
-    }
-    if (!createHostBuffer(dev, sizeof(SceneStatsGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sc.sceneStatsBuffer,
-                          sc.sceneStatsMemory, &sc.sceneStatsMapped)) {
-        return false;
-    }
-    std::memset(sc.sceneStatsMapped, 0, sizeof(SceneStatsGPU));
-
     sc.halfExtent.width = std::max(1u, sc.extent.width / 2u);
     sc.halfExtent.height = std::max(1u, sc.extent.height / 2u);
     sc.presentRgb10PackMode = rgb10PackModeForFormat(sc.format);
     sc.presentUnormBgra = unormBgraForFormat(sc.format);
-
-    if (!createDeviceImage(dev, sc.halfExtent, kBaseFormat,
-                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, sc.baseImage, sc.baseMemory,
-                           sc.baseView)) {
-        return false;
-    }
-    if (!createDeviceImage(dev, sc.extent, kMaskFormat,
-                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, sc.maskImage, sc.maskMemory,
-                           sc.maskView)) {
-        return false;
-    }
-    sc.maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    sc.baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     uint32_t count = 0;
     d.GetSwapchainImagesKHR(dev->device, sc.swapchain, &count, nullptr);
@@ -1346,6 +1251,55 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
                                res.dstImage, res.dstMemory, res.dstView)) {
             return false;
         }
+        if (!createDeviceImage(dev, sc.halfExtent, kBaseFormat,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, res.baseImage, res.baseMemory,
+                               res.baseView)) {
+            return false;
+        }
+        if (!createDeviceImage(dev, sc.extent, kMaskFormat,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, res.maskImage, res.maskMemory,
+                               res.maskView)) {
+            return false;
+        }
+        res.maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        res.baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        if (!createDeviceBuffer(dev, kHistBufferSize,
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, res.histBuffer,
+                                res.histMemory)) {
+            return false;
+        }
+        if (!createDeviceBuffer(dev, sizeof(SceneStatsGPU),
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                res.sceneStatsBuffer, res.sceneStatsMemory)) {
+            return false;
+        }
+        if (!createHostBuffer(dev, sizeof(SceneStatsGPU),
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              res.sceneStatsStaging, res.sceneStatsStagingMemory, &res.sceneStatsStagingMapped)) {
+            return false;
+        }
+        std::memset(res.sceneStatsStagingMapped, 0, sizeof(SceneStatsGPU));
+
+        if (!createHostBuffer(dev, sizeof(ToneParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, res.uboBuffer,
+                              res.uboMemory, &res.uboMapped)
+            || !createHostBuffer(dev, sizeof(float) * AutoHdr::kToneCurveLutSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 res.lutBuffer, res.lutMemory, &res.lutMapped)
+            || !createHostBuffer(dev, sizeof(HistParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, res.histParamsBuffer,
+                                 res.histParamsMemory, &res.histParamsMapped)
+            || !createHostBuffer(dev, sizeof(AdaptParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, res.adaptParamsBuffer,
+                                 res.adaptParamsMemory, &res.adaptParamsMapped)
+            || !createHostBuffer(dev, sizeof(UiParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, res.uiParamsBuffer,
+                                 res.uiParamsMemory, &res.uiParamsMapped)
+            || !createHostBuffer(dev, sizeof(BlurParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, res.blurParamsBuffer,
+                                 res.blurParamsMemory, &res.blurParamsMapped)
+            || !createHostBuffer(dev, sizeof(OverlayParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 res.overlayParamsBuffer, res.overlayParamsMemory, &res.overlayParamsMapped)
+            || !createHostBuffer(dev, sizeof(PresentParamsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 res.presentParamsBuffer, res.presentParamsMemory, &res.presentParamsMapped)) {
+            return false;
+        }
 
         if (isRgb10SwapFormat(sc.format) || isUnorm8SwapFormat(sc.format)) {
             VkImageViewCreateInfo storageViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1358,7 +1312,8 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
             }
         }
 
-        const bool hasPresentPipeline = dev->presentPipeline != VK_NULL_HANDLE || dev->presentUnormPipeline != VK_NULL_HANDLE;
+        const bool hasPresentPipeline =
+            dev->presentPipeline != VK_NULL_HANDLE || dev->presentUnormPipeline != VK_NULL_HANDLE;
         const uint32_t setCount = hasPresentPipeline ? 7u : 6u;
         VkDescriptorSetLayout layouts[7] = {dev->tonemapSetLayout,  dev->histPass1SetLayout,  dev->histPass2SetLayout,
                                             dev->uiClusterSetLayout, dev->baseBlurSetLayout, dev->overlaySetLayout,
@@ -1388,15 +1343,15 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
 
         VkDescriptorImageInfo maskSampleInfo{};
         maskSampleInfo.sampler = dev->sampler;
-        maskSampleInfo.imageView = sc.maskView;
+        maskSampleInfo.imageView = res.maskView;
         maskSampleInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorBufferInfo toneInfo{};
-        toneInfo.buffer = dev->uboBuffer;
+        toneInfo.buffer = res.uboBuffer;
         toneInfo.range = sizeof(ToneParamsUBO);
 
         VkDescriptorBufferInfo lutInfo{};
-        lutInfo.buffer = dev->lutBuffer;
+        lutInfo.buffer = res.lutBuffer;
         lutInfo.range = sizeof(float) * AutoHdr::kToneCurveLutSize;
 
         VkDescriptorImageInfo storageInfo{};
@@ -1404,43 +1359,43 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
         storageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo maskStorageInfo{};
-        maskStorageInfo.imageView = sc.maskView;
+        maskStorageInfo.imageView = res.maskView;
         maskStorageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo baseStorageInfo{};
-        baseStorageInfo.imageView = sc.baseView;
+        baseStorageInfo.imageView = res.baseView;
         baseStorageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorBufferInfo sceneStatsInfo{};
-        sceneStatsInfo.buffer = sc.sceneStatsBuffer;
+        sceneStatsInfo.buffer = res.sceneStatsBuffer;
         sceneStatsInfo.range = sizeof(SceneStatsGPU);
 
         VkDescriptorBufferInfo histInfo{};
-        histInfo.buffer = sc.histBuffer;
+        histInfo.buffer = res.histBuffer;
         histInfo.range = kHistBufferSize;
 
         VkDescriptorBufferInfo histParamsInfo{};
-        histParamsInfo.buffer = dev->histParamsBuffer;
+        histParamsInfo.buffer = res.histParamsBuffer;
         histParamsInfo.range = sizeof(HistParamsUBO);
 
         VkDescriptorBufferInfo adaptParamsInfo{};
-        adaptParamsInfo.buffer = dev->adaptParamsBuffer;
+        adaptParamsInfo.buffer = res.adaptParamsBuffer;
         adaptParamsInfo.range = sizeof(AdaptParamsUBO);
 
         VkDescriptorBufferInfo uiParamsInfo{};
-        uiParamsInfo.buffer = dev->uiParamsBuffer;
+        uiParamsInfo.buffer = res.uiParamsBuffer;
         uiParamsInfo.range = sizeof(UiParamsUBO);
 
         VkDescriptorBufferInfo blurParamsInfo{};
-        blurParamsInfo.buffer = dev->blurParamsBuffer;
+        blurParamsInfo.buffer = res.blurParamsBuffer;
         blurParamsInfo.range = sizeof(BlurParamsUBO);
 
         VkDescriptorBufferInfo overlayParamsInfo{};
-        overlayParamsInfo.buffer = dev->overlayParamsBuffer;
+        overlayParamsInfo.buffer = res.overlayParamsBuffer;
         overlayParamsInfo.range = sizeof(OverlayParamsUBO);
 
         VkDescriptorBufferInfo presentParamsInfo{};
-        presentParamsInfo.buffer = dev->presentParamsBuffer;
+        presentParamsInfo.buffer = res.presentParamsBuffer;
         presentParamsInfo.range = sizeof(PresentParamsUBO);
 
         VkWriteDescriptorSet tonemapWrites[6]{};
@@ -1671,7 +1626,8 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc)
 }
 
 bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQueue queue, uint32_t waitCount,
-                    const VkSemaphore *waitSemaphores, VkSemaphore &outSignal, bool effectOn, bool drawOverlay)
+                    const VkSemaphore *waitSemaphores, VkSemaphore &outSignal, bool effectOn, bool drawOverlay,
+                    const AutoHdr::CalibrationSettings &settings, bool hdrMetadataEnabled)
 {
     if (!sc.active || imageIndex >= sc.images.size()) {
         return false;
@@ -1681,18 +1637,29 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     auto &res = sc.images[imageIndex];
     d.WaitForFences(dev->device, 1, &res.fence, VK_TRUE, UINT64_MAX);
 
-    const AutoHdr::CalibrationSettings settings = effectiveSettings();
+    // Pull completed GPU stats from staging (from this image's previous submit) into the
+    // swapchain-level CPU snapshot used for EMA seeding + HDR metadata / HUD.
+    if (res.sceneStatsStagingMapped) {
+        const auto *staged = static_cast<const SceneStatsGPU *>(res.sceneStatsStagingMapped);
+        if (staged->initialized != 0) {
+            sc.latestCpuStats = *staged;
+            sc.latestCpuStatsValid = true;
+        }
+        // Seed next GPU EMA from the most recent completed stats (any image).
+        if (sc.latestCpuStatsValid) {
+            std::memcpy(res.sceneStatsStagingMapped, &sc.latestCpuStats, sizeof(SceneStatsGPU));
+        } else {
+            std::memset(res.sceneStatsStagingMapped, 0, sizeof(SceneStatsGPU));
+        }
+    }
 
     float metaMaxCLL = settings.maxNits;
     float metaMaxFALL = settings.referenceNits;
     float metaEffectivePeak = settings.maxNits;
-    if (sc.sceneStatsMapped) {
-        const auto *stats = static_cast<const SceneStatsGPU *>(sc.sceneStatsMapped);
-        if (stats->initialized != 0) {
-            metaMaxCLL = stats->maxCLL;
-            metaMaxFALL = stats->maxFALL;
-            metaEffectivePeak = stats->effectivePeak;
-        }
+    if (sc.latestCpuStatsValid) {
+        metaMaxCLL = sc.latestCpuStats.maxCLL;
+        metaMaxFALL = sc.latestCpuStats.maxFALL;
+        metaEffectivePeak = sc.latestCpuStats.effectivePeak;
     }
 
     d.ResetFences(dev->device, 1, &res.fence);
@@ -1712,7 +1679,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
 
     if (effectOn) {
         const bool usePresentCompute = canUsePresentCompute(dev, sc, res);
-        uploadToneParams(dev, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent, sc.format,
+        uploadToneParams(dev, res, settings, sc.encoding, sc.inputIsSrgb, sc.extent, sc.halfExtent, sc.format,
                          usePresentCompute);
 
         if (!sc.presentPathLogged) {
@@ -1734,6 +1701,8 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         overlayUbo.intensity = hud.intensity;
         overlayUbo.colorIntensity = hud.colorIntensity;
         overlayUbo.expansionShape = hud.expansionShape;
+        overlayUbo.expansionScurve = hud.expansionScurve;
+        overlayUbo.expansionMid = hud.expansionMid;
         overlayUbo.focused = static_cast<float>(hud.focused);
         overlayUbo.outputMode = outputMode;
         overlayUbo.panelNits = hud.panelNits;
@@ -1742,8 +1711,24 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         overlayUbo.pointerY = hud.pointerY;
         overlayUbo.blackFloor = hud.blackFloor;
         overlayUbo.highlightStretch = hud.highlightStretch;
+        overlayUbo.stretchWhiteRef = hud.stretchWhiteRef;
+        overlayUbo.highlightBlowout = hud.highlightBlowout;
+        overlayUbo.highlightSoftness = hud.highlightSoftness;
         overlayUbo.debandStrength = hud.debandStrength;
-        uploadOverlayParams(dev, overlayUbo);
+        overlayUbo.peakNitsRef = settings.maxNits;
+        overlayUbo.showIntensity = hud.showIntensity ? 1.0f : 0.0f;
+        overlayUbo.showFinishing = hud.showFinishing ? 1.0f : 0.0f;
+        overlayUbo.splitCurveSliders = hud.splitCurveSliders ? 1.0f : 0.0f;
+        if (sc.latestCpuStatsValid) {
+            overlayUbo.sceneNearMax = sc.latestCpuStats.nearMax;
+            overlayUbo.sceneP90 = sc.latestCpuStats.p90;
+            overlayUbo.sceneContentWhite = sc.latestCpuStats.contentWhite;
+            overlayUbo.sceneStretchOut = sc.latestCpuStats.stretchOut;
+            overlayUbo.sceneMaxCLL = sc.latestCpuStats.maxCLL;
+            overlayUbo.sceneGap = sc.latestCpuStats.highlightGap;
+            overlayUbo.sceneStatsValid = 1.0f;
+        }
+        uploadOverlayParams(res, overlayUbo);
     }
 
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1792,12 +1777,30 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, barriers);
 
-        d.CmdFillBuffer(res.cmd, sc.histBuffer, 0, kHistBufferSize, 0);
+        // Seed device sceneStats from host staging (EMA continuity across images).
+        VkBufferCopy statsSeedCopy{};
+        statsSeedCopy.size = sizeof(SceneStatsGPU);
+        d.CmdCopyBuffer(res.cmd, res.sceneStatsStaging, res.sceneStatsBuffer, 1, &statsSeedCopy);
+
+        VkBufferMemoryBarrier seedBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        seedBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        seedBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        seedBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        seedBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        seedBarrier.buffer = res.sceneStatsBuffer;
+        seedBarrier.offset = 0;
+        seedBarrier.size = sizeof(SceneStatsGPU);
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
+                             &seedBarrier, 0, nullptr);
+
+        d.CmdFillBuffer(res.cmd, res.histBuffer, 0, kHistBufferSize, 0);
 
         VkBufferMemoryBarrier histBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         histBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         histBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        histBarrier.buffer = sc.histBuffer;
+        histBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        histBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        histBarrier.buffer = res.histBuffer;
         histBarrier.offset = 0;
         histBarrier.size = kHistBufferSize;
         d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
@@ -1822,32 +1825,51 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
 
         VkBufferMemoryBarrier sceneStatsBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         sceneStatsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        sceneStatsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        sceneStatsBarrier.buffer = sc.sceneStatsBuffer;
+        sceneStatsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        sceneStatsBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sceneStatsBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sceneStatsBarrier.buffer = res.sceneStatsBuffer;
         sceneStatsBarrier.offset = 0;
         sceneStatsBarrier.size = sizeof(SceneStatsGPU);
-        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                             nullptr, 1, &sceneStatsBarrier, 0, nullptr);
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                             &sceneStatsBarrier, 0, nullptr);
 
-        const bool maskWasUndefined = (sc.maskLayout == VK_IMAGE_LAYOUT_UNDEFINED);
-        const bool baseWasUndefined = (sc.baseLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+        // Async CPU readback for next reuse of this image / metadata.
+        VkBufferCopy statsReadback{};
+        statsReadback.size = sizeof(SceneStatsGPU);
+        d.CmdCopyBuffer(res.cmd, res.sceneStatsBuffer, res.sceneStatsStaging, 1, &statsReadback);
+
+        VkBufferMemoryBarrier stagingBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        stagingBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        stagingBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingBarrier.buffer = res.sceneStatsStaging;
+        stagingBarrier.offset = 0;
+        stagingBarrier.size = sizeof(SceneStatsGPU);
+        d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                             &stagingBarrier, 0, nullptr);
+
+        const bool maskWasUndefined = (res.maskLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+        const bool baseWasUndefined = (res.baseLayout == VK_IMAGE_LAYOUT_UNDEFINED);
         barriers[0].srcAccessMask = maskWasUndefined ? 0 : VK_ACCESS_SHADER_READ_BIT;
         barriers[0].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barriers[0].oldLayout = sc.maskLayout;
+        barriers[0].oldLayout = res.maskLayout;
         barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[0].image = sc.maskImage;
+        barriers[0].image = res.maskImage;
 
         barriers[1].srcAccessMask = baseWasUndefined ? 0 : VK_ACCESS_SHADER_READ_BIT;
         barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barriers[1].oldLayout = sc.baseLayout;
+        barriers[1].oldLayout = res.baseLayout;
         barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[1].image = sc.baseImage;
+        barriers[1].image = res.baseImage;
         d.CmdPipelineBarrier(res.cmd,
                              maskWasUndefined && baseWasUndefined ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                                                                   : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
-        sc.maskLayout = VK_IMAGE_LAYOUT_GENERAL;
-        sc.baseLayout = VK_IMAGE_LAYOUT_GENERAL;
+        res.maskLayout = VK_IMAGE_LAYOUT_GENERAL;
+        res.baseLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         // UI detection temporarily disabled — flip to true to re-enable dispatch.
         constexpr bool kEnableUiDetection = false;
@@ -1871,13 +1893,13 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barriers[0].image = sc.maskImage;
+        barriers[0].image = res.maskImage;
 
         barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barriers[1].image = sc.baseImage;
+        barriers[1].image = res.baseImage;
 
         barriers[2].srcAccessMask = 0;
         barriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1886,8 +1908,8 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         barriers[2].image = res.dstImage;
         d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                              nullptr, 0, nullptr, 3, barriers);
-        sc.maskLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        sc.baseLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        res.maskLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        res.baseLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         d.CmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->tonemapPipeline);
         d.CmdBindDescriptorSets(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dev->tonemapPipelineLayout, 0, 1, &res.tonemapSet,
@@ -1991,12 +2013,10 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
     blit.srcOffsets[1] = {static_cast<int32_t>(sc.extent.width), static_cast<int32_t>(sc.extent.height), 1};
     blit.dstOffsets[1] = blit.srcOffsets[1];
 
-    const bool usePresentRgb10 =
-        isRgb10SwapFormat(sc.format) && dev->presentPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
-        && res.swapStorageView != VK_NULL_HANDLE;
-    const bool usePresentUnorm =
-        isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE && res.presentSet != VK_NULL_HANDLE
-        && res.swapStorageView != VK_NULL_HANDLE;
+    const bool usePresentRgb10 = effectOn && isRgb10SwapFormat(sc.format) && dev->presentPipeline != VK_NULL_HANDLE
+        && res.presentSet != VK_NULL_HANDLE && res.swapStorageView != VK_NULL_HANDLE;
+    const bool usePresentUnorm = effectOn && isUnorm8SwapFormat(sc.format) && dev->presentUnormPipeline != VK_NULL_HANDLE
+        && res.presentSet != VK_NULL_HANDLE && res.swapStorageView != VK_NULL_HANDLE;
     const bool usePresentCompute = usePresentRgb10 || usePresentUnorm;
 
     if (usePresentCompute) {
@@ -2014,7 +2034,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
         d.CmdPipelineBarrier(res.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                              0, nullptr, 2, barriers);
 
-        if (dev->presentParamsMapped) {
+        if (res.presentParamsMapped) {
             PresentParamsUBO presentParams{};
             presentParams.extentWidth = sc.extent.width;
             presentParams.extentHeight = sc.extent.height;
@@ -2025,7 +2045,7 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
             presentParams.ditherStrength =
                 settings.dither ? AutoHdr::clampDitherStrength(settings.ditherStrength) : 0.0f;
             presentParams.useBlueNoise = dev->blueNoiseReady ? 1.0f : 0.0f;
-            std::memcpy(dev->presentParamsMapped, &presentParams, sizeof(presentParams));
+            std::memcpy(res.presentParamsMapped, &presentParams, sizeof(presentParams));
         }
 
         const uint32_t gx = (sc.extent.width + 15u) / 16u;
@@ -2058,9 +2078,14 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
 
     d.EndCommandBuffer(res.cmd);
 
-    std::vector<VkPipelineStageFlags> waitStages(waitCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    constexpr uint32_t kMaxWaitSemaphores = 16;
+    std::array<VkPipelineStageFlags, kMaxWaitSemaphores> waitStages{};
+    const uint32_t clampedWait = std::min(waitCount, kMaxWaitSemaphores);
+    for (uint32_t i = 0; i < clampedWait; ++i) {
+        waitStages[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.waitSemaphoreCount = waitCount;
+    submit.waitSemaphoreCount = clampedWait;
     submit.pWaitSemaphores = waitSemaphores;
     submit.pWaitDstStageMask = waitStages.data();
     submit.commandBufferCount = 1;
@@ -2074,17 +2099,38 @@ bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQ
 
     outSignal = res.doneSemaphore;
 
-    if (effectOn && wantHdrMetadata() && dev->hdrMetadataExt && d.SetHdrMetadataEXT && sc.hdrColorspace) {
-        VkHdrMetadataEXT meta{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
-        meta.displayPrimaryRed = {0.708f, 0.292f};
-        meta.displayPrimaryGreen = {0.170f, 0.797f};
-        meta.displayPrimaryBlue = {0.131f, 0.046f};
-        meta.whitePoint = {0.3127f, 0.3290f};
-        meta.maxLuminance = metaEffectivePeak;
-        meta.minLuminance = 0.0f;
-        meta.maxContentLightLevel = metaMaxCLL;
-        meta.maxFrameAverageLightLevel = metaMaxFALL;
-        d.SetHdrMetadataEXT(dev->device, 1, &sc.swapchain, &meta);
+    if (effectOn && hdrMetadataEnabled && dev->hdrMetadataExt && d.SetHdrMetadataEXT && sc.hdrColorspace) {
+        constexpr float kMetaRelEps = 0.02f;
+        constexpr uint64_t kMetaMinIntervalNs = 200000000ull; // 5 Hz
+        const auto nowNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const auto relDelta = [](float a, float b) {
+            const float denom = std::max(std::max(std::fabs(a), std::fabs(b)), 1.0f);
+            return std::fabs(a - b) / denom;
+        };
+        const bool first = sc.lastMetaMaxCLL < 0.0f;
+        const bool changed = first || relDelta(metaMaxCLL, sc.lastMetaMaxCLL) > kMetaRelEps
+            || relDelta(metaMaxFALL, sc.lastMetaMaxFALL) > kMetaRelEps
+            || relDelta(metaEffectivePeak, sc.lastMetaPeak) > kMetaRelEps;
+        const bool due = first || (nowNs - sc.lastMetaNs) >= kMetaMinIntervalNs;
+        if (changed && due) {
+            VkHdrMetadataEXT meta{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
+            meta.displayPrimaryRed = {0.708f, 0.292f};
+            meta.displayPrimaryGreen = {0.170f, 0.797f};
+            meta.displayPrimaryBlue = {0.131f, 0.046f};
+            meta.whitePoint = {0.3127f, 0.3290f};
+            meta.maxLuminance = metaEffectivePeak;
+            meta.minLuminance = 0.0f;
+            meta.maxContentLightLevel = metaMaxCLL;
+            meta.maxFrameAverageLightLevel = metaMaxFALL;
+            d.SetHdrMetadataEXT(dev->device, 1, &sc.swapchain, &meta);
+            sc.lastMetaMaxCLL = metaMaxCLL;
+            sc.lastMetaMaxFALL = metaMaxFALL;
+            sc.lastMetaPeak = metaEffectivePeak;
+            sc.lastMetaNs = nowNs;
+        }
     }
 
     return true;

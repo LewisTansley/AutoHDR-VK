@@ -46,6 +46,20 @@ float exponentialMapping(float t)
     return (std::exp(k * t) - 1.0f) / denom;
 }
 
+// Remapped logistic S-curve through [0,1] with fixed endpoints (k≈6).
+float logisticSCurve(float t)
+{
+    constexpr float k = 6.0f;
+    const auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-k * (x - 0.5f))); };
+    const float y0 = sig(0.0f);
+    const float y1 = sig(1.0f);
+    const float denom = y1 - y0;
+    if (std::abs(denom) < 1e-6f) {
+        return t;
+    }
+    return (sig(t) - y0) / denom;
+}
+
 std::vector<Vec2> generateCalibratedIntermediatePoints(const BuiltInCalibratedCurve &curve, const PresetCurveParams &params)
 {
     const float ref = std::max(params.referenceNits, 1e-3f);
@@ -143,21 +157,35 @@ std::vector<Vec2> generatePresetIntermediatePoints(ToneCurvePreset preset, const
         return {};
     }
 
-    return generateExpansionShapePoints(1.0f, params);
+    return generateExpansionShapePoints(1.0f, 0.0f, 0.5f, params);
 }
 
-std::vector<Vec2> generateExpansionShapePoints(float shape, const PresetCurveParams &params)
+std::vector<Vec2> generateExpansionShapePoints(float shape, float scurve, float mid,
+                                               const PresetCurveParams &params)
 {
     const float ref = std::max(params.referenceNits, 1e-3f);
     const float peak = std::max(params.peakNits, ref);
     const float s = std::clamp(shape, 0.0f, 1.0f);
+    const float c = std::clamp(scurve, 0.0f, 1.0f);
+    const float m = std::clamp(mid, 0.0f, 1.0f);
+    // mid=0.5 → identity; full travel ±kMaxMidLift at t=0.5.
+    constexpr float kMaxMidLift = 0.35f;
+    const float bias = (m - 0.5f) * 2.0f;
 
-    // Dense enough intermediates for a smooth LUT morph between linear and exponential.
+    // Dense enough intermediates for a smooth LUT morph between linear and exponential,
+    // then layer an S-curve residual (scurve=0 → identity on the shape base).
+    // Upper-half residual is tapered with 2*(1-t) so mid contrast stays while near-peak
+    // headroom is preserved; then Knee mid-height bias (zero at endpoints).
     constexpr float kFractions[] = {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f};
     std::vector<Vec2> points;
     points.reserve(sizeof(kFractions) / sizeof(kFractions[0]));
     for (float t : kFractions) {
-        const float outNorm = t + (exponentialMapping(t) - t) * s;
+        const float base = t + (exponentialMapping(t) - t) * s;
+        const float residual = logisticSCurve(t) - t;
+        const float highlightTaper = (t > 0.5f) ? (2.0f * (1.0f - t)) : 1.0f;
+        const float withScurve = base + residual * c * highlightTaper;
+        const float w = 4.0f * t * (1.0f - t);
+        const float outNorm = std::clamp(withScurve + bias * kMaxMidLift * w, 0.0f, 1.0f);
         points.push_back({t * ref, outNorm * peak});
     }
 

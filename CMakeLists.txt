@@ -77,7 +77,7 @@ endfunction()
 
 compile_shader(tonemap.comp tonemap_comp_spv ${SHADER_DIR}/deband.glsl ${SHADER_DIR}/tonemap_dither.glsl)
 compile_shader(histogram_pass1.comp histogram_pass1_comp_spv)
-compile_shader(histogram_pass2.comp histogram_pass2_comp_spv)
+compile_shader(histogram_pass2.comp histogram_pass2_comp_spv ${SHADER_DIR}/histogram_stretch.glsl)
 compile_shader(ui_cluster.comp ui_cluster_comp_spv)
 compile_shader(base_blur.comp base_blur_comp_spv)
 compile_shader(overlay.comp overlay_comp_spv ${SHADER_DIR}/overlay_font.glsl ${OVERLAY_FONT_METRICS_GLSL})

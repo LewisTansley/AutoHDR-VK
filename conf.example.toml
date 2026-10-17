@@ -9,26 +9,45 @@ intensity = 0.5
 # Also scales gamut_expansion (see advanced overrides).
 color_intensity = 0.33
 
-# Shadow→highlight expansion shape (0 = linear, 1 = exponential). Overlay "Shape" slider.
-expansion_shape = 0.55
+# Combined Curve slider. 0 = full exponential (shape 1, scurve 0), 1 = full S (shape 0, scurve 1).
+# The overlay writes expansion_shape = 1 - t and expansion_scurve = t.
+# Previous default (shape 0.55, scurve 0) projects to t = 0.225.
+expansion_shape = 0.775
+expansion_scurve = 0.225
+
+# Set true to edit Shape and Scurve as independent overlay sliders.
+# Off-axis pairs are kept. Overlay save does not change this flag.
+split_curve_sliders = false
+
+# Tone-curve mid/knee height (0.5 = current Shape+Scurve mid, <0.5 lowers, >0.5 heightens). Overlay "Knee".
+expansion_mid = 0.5
 
 # Raised-floor black crush (0 = off, 1 = max). Overlay "Floor" slider.
 black_floor = 0.0
 
-# Histogram highlight pre-stretch (0 = off, 0.45 = default, 1 = legacy max, 2 = aggressive). Overlay "Stretch" slider.
+# Histogram highlight-tail pre-stretch (0=off, 0.45=default, 1=legacy max). Overlay "Stretch" slider (0–1).
+# Lifts only the top of content-white; mids stay put. Dark-scene raise pulls back when near-max
+# highlights are already present; mid-luminance frames without speculars stay gain-capped.
 highlight_stretch = 0.45
+
+# Stretch content-white reference (0=p100 near-max default, 1=p98). Overlay "White" slider.
+stretch_white_ref = 0.0
+
+# Highlight separation / punch (0=off, 1=full). Flat lows/mids + log boost above mid. Config only.
+separation = 0.0
 
 # Advanced overrides (optional; kept for back-compat)
 # reference_nits = 203
 # peak_nits = 1000
 # black_point = 0.0   # legacy linear offset; prefer black_floor
 # gamut_expansion = 1.5   # max expand scale when color_intensity = 1 (default 1.5)
-# highlight_softness = 0.30
+# highlight_softness = 1.0   # SOFTEN overlay slider (0–1); hidden unless AUTOHDR_SHOW_FINISHING=1
 # perceptual_color = true
 # tone_curve_preset = "balanced"
 # dither = true            # present-pass bit-depth dither (auto; not overlay-tuned)
 # dither_strength = 1.25   # present-pass dither strength when dither = true
-# deband_strength = 0.7    # SMOOTH overlay slider: mpv-style spatial deband (0–1)
+# deband_strength = 1.0    # SMOOTH overlay slider: mpv-style spatial deband (0–1); hidden unless AUTOHDR_SHOW_FINISHING=1
+# highlight_blowout = 0.0  # BLOWOUT overlay slider: RenoDX-style highlight desat (0–1)
 
 # auto | pq | scrgb | sdr_preview
 encoding = "auto"

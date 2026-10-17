@@ -31,8 +31,11 @@ ToneCurvePreset presetFromString(const std::string &encoded);
 std::vector<ToneCurvePreset> builtInToneCurvePresets();
 
 std::vector<Vec2> generatePresetIntermediatePoints(ToneCurvePreset preset, const PresetCurveParams &params);
-// Morph linear (shape=0) → exponential (shape=1) intermediate points for the live LUT.
-std::vector<Vec2> generateExpansionShapePoints(float shape, const PresetCurveParams &params);
+// Morph linear (shape=0) → exponential (shape=1), then S-curve residual (scurve 0–1;
+// darker lows / mid contrast with highlight-side taper), then mid/knee height bias
+// (mid 0.5 = identity, <0.5 lowers, >0.5 heightens).
+std::vector<Vec2> generateExpansionShapePoints(float shape, float scurve, float mid,
+                                               const PresetCurveParams &params);
 void applyToneCurvePreset(CalibrationSettings &settings);
 
 } // namespace AutoHdr

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -101,6 +102,7 @@ struct DeviceDispatch {
     PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
+    PFN_vkCmdCopyBuffer CmdCopyBuffer = nullptr;
     PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
     PFN_vkCmdDispatch CmdDispatch = nullptr;
@@ -126,14 +128,16 @@ struct ToneParamsUBO {
     float referenceNits = 203.0f;
     float peakNits = 1000.0f;
     float toneCurveInputSpan = 203.0f;
-    float highlightSoftness = 0.30f;
+    float highlightSoftness = 1.0f;
     float perceptualColorEnabled = 1.0f;
     float outputMode = 0.0f;
     float inputIsSrgb = 1.0f;
     float intensity = 0.5f;
-    float highlightStretch = 0.45f;
-    float debandStrength = 0.7f;
-    float _padTone[3] = {0.0f, 0.0f, 0.0f}; // std140: pad 48→64 before vec4
+    float debandStrength = 1.0f;
+    float highlightBlowout = 0.0f;
+    float separation = 0.0f; // SEP: Ultra HDR–style highlight punch weight
+    float highlightStretch = 0.45f; // STRETCH: tonemap blend weight (soft-engage squared)
+    float _padTone[1] = {0.0f}; // std140: pad to vec4 before pqBoostParams
     float pqBoostParams[4] = {10000.0f, 10000.0f, 1.0f, 0.0f};
     uint32_t extentWidth = 0;
     uint32_t extentHeight = 0;
@@ -149,7 +153,9 @@ struct OverlayParamsUBO {
     uint32_t extentHeight = 0;
     float intensity = 0.5f;
     float colorIntensity = 0.33f;
-    float expansionShape = 0.55f;
+    float expansionShape = 0.775f;
+    float expansionScurve = 0.225f;
+    float expansionMid = 0.5f;
     float focused = 0.0f;
     float outputMode = 0.0f;
     float panelNits = 203.0f;
@@ -158,7 +164,21 @@ struct OverlayParamsUBO {
     float pointerY = 0.0f;
     float blackFloor = 0.0f;
     float highlightStretch = 0.45f;
-    float debandStrength = 0.7f;
+    float stretchWhiteRef = 0.0f;
+    float highlightBlowout = 0.0f;
+    float highlightSoftness = 1.0f;
+    float debandStrength = 1.0f;
+    float sceneNearMax = 0.0f;
+    float sceneP90 = 0.0f;
+    float sceneContentWhite = 0.0f;
+    float sceneStretchOut = 0.0f;
+    float sceneMaxCLL = 0.0f;
+    float sceneGap = 0.0f;
+    float sceneStatsValid = 0.0f;
+    float peakNitsRef = 1000.0f;
+    float showIntensity = 0.0f;
+    float showFinishing = 0.0f;
+    float splitCurveSliders = 0.0f;
 };
 
 struct HistParamsUBO {
@@ -176,7 +196,8 @@ struct AdaptParamsUBO {
     float adaptBrighten = 0.25f;
     float adaptDarken = 0.05f;
     float temporalEnable = 1.0f;
-    float _pad = 0.0f;
+    float stretchWhiteRef = 0.0f;
+    float highlightStretch = 0.45f;
 };
 
 struct UiParamsUBO {
@@ -201,15 +222,19 @@ struct SceneStatsGPU {
     float geoMean = 0.18f;
     float p10 = 0.02f; // p05 floor candidate
     float p90 = 0.45f;
-    float p98 = 0.95f; // near-max content white (see histogram_pass2)
-    float k1 = 0.08f;  // p25 bulk shadow for flatness
+    float p92 = 0.55f;
+    float p94 = 0.62f;
+    float p96 = 0.68f;
+    float p98_cdf = 0.78f;
+    float nearMax = 0.95f; // p100 near-max content white (see histogram_pass2)
+    float k1 = 0.08f;      // p25 bulk shadow for flatness
+    float contentWhite = 0.85f;
+    float stretchOut = 0.90f;
+    float highlightGap = 0.10f;
     float effectivePeak = 1000.0f;
     float maxCLL = 1000.0f;
     float maxFALL = 203.0f;
     uint32_t initialized = 0;
-    uint32_t _pad0 = 0;
-    uint32_t _pad1 = 0;
-    uint32_t _pad2 = 0;
 };
 
 struct PresentParamsUBO {
@@ -237,6 +262,50 @@ struct SwapchainImageResources {
     VkImage dstImage = VK_NULL_HANDLE; // rgba16f compute output
     VkDeviceMemory dstMemory = VK_NULL_HANDLE;
     VkImageView dstView = VK_NULL_HANDLE;
+
+    VkImage baseImage = VK_NULL_HANDLE;
+    VkDeviceMemory baseMemory = VK_NULL_HANDLE;
+    VkImageView baseView = VK_NULL_HANDLE;
+    VkImage maskImage = VK_NULL_HANDLE;
+    VkDeviceMemory maskMemory = VK_NULL_HANDLE;
+    VkImageView maskView = VK_NULL_HANDLE;
+    VkImageLayout maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkBuffer histBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory histMemory = VK_NULL_HANDLE;
+    // Device-local scene stats (GPU R/W). Host staging used to seed EMA + CPU readback.
+    VkBuffer sceneStatsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory sceneStatsMemory = VK_NULL_HANDLE;
+    VkBuffer sceneStatsStaging = VK_NULL_HANDLE;
+    VkDeviceMemory sceneStatsStagingMemory = VK_NULL_HANDLE;
+    void *sceneStatsStagingMapped = nullptr;
+
+    VkBuffer lutBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory lutMemory = VK_NULL_HANDLE;
+    void *lutMapped = nullptr;
+    VkBuffer uboBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory uboMemory = VK_NULL_HANDLE;
+    void *uboMapped = nullptr;
+    VkBuffer histParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory histParamsMemory = VK_NULL_HANDLE;
+    void *histParamsMapped = nullptr;
+    VkBuffer adaptParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory adaptParamsMemory = VK_NULL_HANDLE;
+    void *adaptParamsMapped = nullptr;
+    VkBuffer uiParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory uiParamsMemory = VK_NULL_HANDLE;
+    void *uiParamsMapped = nullptr;
+    VkBuffer blurParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory blurParamsMemory = VK_NULL_HANDLE;
+    void *blurParamsMapped = nullptr;
+    VkBuffer overlayParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory overlayParamsMemory = VK_NULL_HANDLE;
+    void *overlayParamsMapped = nullptr;
+    VkBuffer presentParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory presentParamsMemory = VK_NULL_HANDLE;
+    void *presentParamsMapped = nullptr;
+
     VkDescriptorSet tonemapSet = VK_NULL_HANDLE;
     VkDescriptorSet histPass1Set = VK_NULL_HANDLE;
     VkDescriptorSet histPass2Set = VK_NULL_HANDLE;
@@ -249,6 +318,38 @@ struct SwapchainImageResources {
     VkSemaphore doneSemaphore = VK_NULL_HANDLE;
 };
 
+struct PresentRefCount {
+    std::atomic<uint32_t> value{0};
+
+    PresentRefCount() = default;
+    PresentRefCount(const PresentRefCount &) = delete;
+    PresentRefCount &operator=(const PresentRefCount &) = delete;
+    PresentRefCount(PresentRefCount &&other) noexcept
+    {
+        value.store(other.value.exchange(0, std::memory_order_acq_rel), std::memory_order_relaxed);
+    }
+    PresentRefCount &operator=(PresentRefCount &&other) noexcept
+    {
+        if (this != &other) {
+            value.store(other.value.exchange(0, std::memory_order_acq_rel), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+    uint32_t fetch_add(uint32_t v, std::memory_order order) noexcept
+    {
+        return value.fetch_add(v, order);
+    }
+    uint32_t fetch_sub(uint32_t v, std::memory_order order) noexcept
+    {
+        return value.fetch_sub(v, order);
+    }
+    uint32_t load(std::memory_order order) const noexcept
+    {
+        return value.load(order);
+    }
+};
+
 struct SwapchainData {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -256,14 +357,6 @@ struct SwapchainData {
     VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D extent{};
     VkExtent2D halfExtent{};
-    VkImage baseImage = VK_NULL_HANDLE;
-    VkDeviceMemory baseMemory = VK_NULL_HANDLE;
-    VkImageView baseView = VK_NULL_HANDLE;
-    VkImage maskImage = VK_NULL_HANDLE;
-    VkDeviceMemory maskMemory = VK_NULL_HANDLE;
-    VkImageView maskView = VK_NULL_HANDLE;
-    VkImageLayout maskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout baseLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t queueFamily = 0;
     bool active = false;
     bool hdrColorspace = false;
@@ -273,11 +366,18 @@ struct SwapchainData {
     bool presentUnormBgra = false;
     bool presentPathLogged = false;
 
-    VkBuffer histBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory histMemory = VK_NULL_HANDLE;
-    VkBuffer sceneStatsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory sceneStatsMemory = VK_NULL_HANDLE;
-    void *sceneStatsMapped = nullptr;
+    // Last CPU-visible scene stats (for EMA seed + HDR metadata). Updated after image fence waits.
+    SceneStatsGPU latestCpuStats{};
+    bool latestCpuStatsValid = false;
+
+    // Debounced HDR metadata last-sent values.
+    float lastMetaMaxCLL = -1.0f;
+    float lastMetaMaxFALL = -1.0f;
+    float lastMetaPeak = -1.0f;
+    uint64_t lastMetaNs = 0;
+
+    // QueuePresent may release device mutex while this swapchain is mid-processPresent.
+    PresentRefCount presentRefs{};
 
     std::vector<SwapchainImageResources> images;
 };
@@ -324,37 +424,14 @@ struct DeviceData {
     VkPipeline presentPipeline = VK_NULL_HANDLE;
     VkPipeline presentUnormPipeline = VK_NULL_HANDLE;
 
-    VkBuffer lutBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory lutMemory = VK_NULL_HANDLE;
-    void *lutMapped = nullptr;
-
-    VkBuffer uboBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory uboMemory = VK_NULL_HANDLE;
-    void *uboMapped = nullptr;
-
-    VkBuffer histParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory histParamsMemory = VK_NULL_HANDLE;
-    void *histParamsMapped = nullptr;
-
-    VkBuffer adaptParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory adaptParamsMemory = VK_NULL_HANDLE;
-    void *adaptParamsMapped = nullptr;
-
-    VkBuffer uiParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory uiParamsMemory = VK_NULL_HANDLE;
-    void *uiParamsMapped = nullptr;
-
-    VkBuffer blurParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory blurParamsMemory = VK_NULL_HANDLE;
-    void *blurParamsMapped = nullptr;
-
-    VkBuffer overlayParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory overlayParamsMemory = VK_NULL_HANDLE;
-    void *overlayParamsMapped = nullptr;
-
-    VkBuffer presentParamsBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory presentParamsMemory = VK_NULL_HANDLE;
-    void *presentParamsMapped = nullptr;
+    // Cached tone curve LUT — rebuilt only when expansion/ref/peak change.
+    float cachedLut[AutoHdr::kToneCurveLutSize]{};
+    float cachedLutShape = -1.0f;
+    float cachedLutScurve = -1.0f;
+    float cachedLutMid = -1.0f;
+    float cachedLutRef = -1.0f;
+    float cachedLutPeak = -1.0f;
+    bool cachedLutValid = false;
 
     VkImage overlayFontImage = VK_NULL_HANDLE;
     VkDeviceMemory overlayFontMemory = VK_NULL_HANDLE;
@@ -395,10 +472,11 @@ bool createSwapchainResources(DeviceData *dev, SwapchainData &sc);
 void destroySwapchainResources(DeviceData *dev, SwapchainData &sc);
 bool processPresent(DeviceData *dev, SwapchainData &sc, uint32_t imageIndex, VkQueue queue,
                     uint32_t waitCount, const VkSemaphore *waitSemaphores, VkSemaphore &outSignal,
-                    bool effectOn, bool drawOverlay);
-void uploadToneParams(DeviceData *dev, const AutoHdr::CalibrationSettings &settings, OutputEncoding encoding,
-                      bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent, VkFormat swapFormat,
-                      bool presentUsesCompute);
-void uploadOverlayParams(DeviceData *dev, const OverlayParamsUBO &params);
+                    bool effectOn, bool drawOverlay, const AutoHdr::CalibrationSettings &settings,
+                    bool hdrMetadataEnabled);
+void uploadToneParams(DeviceData *dev, SwapchainImageResources &res, const AutoHdr::CalibrationSettings &settings,
+                      OutputEncoding encoding, bool inputIsSrgb, VkExtent2D extent, VkExtent2D halfExtent,
+                      VkFormat swapFormat, bool presentUsesCompute);
+void uploadOverlayParams(SwapchainImageResources &res, const OverlayParamsUBO &params);
 
 } // namespace AutoHdrVk

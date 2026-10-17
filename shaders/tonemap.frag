@@ -21,6 +21,7 @@ layout(std140, set = 0, binding = 2) uniform ToneParams {
     float perceptualColorEnabled;
     float outputMode; // 0=pq, 1=scrgb, 2=sdr preview
     float inputIsSrgb;
+    float highlightBlowout;
     float _pad0;
     float _pad1;
     vec4 pqBoostParams;
@@ -54,6 +55,7 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
         if (gamutExpansion > 0.0) {
             rgbNits = expandGamutSmart(rgbNits / ref, gamutExpansion) * ref;
         }
+        rgbNits = applyHighlightBlowout(rgbNits, displayPeak, highlightBlowout);
         vec3 xyz = autohdrRec709ToXYZ(rgbNits);
         float outY = max(xyz.y, 1e-6);
         float limitedY = applyHighlightPeakLimit(outY, displayPeak, highlightSoftness);
@@ -64,6 +66,7 @@ vec3 toneMapPipeline(vec3 rgbNits, float ref, float displayPeak, float curveSpan
         if (gamutExpansion > 0.0) {
             rgbNits = expandGamutSmart(rgbNits / ref, gamutExpansion) * ref;
         }
+        rgbNits = applyHighlightBlowout(rgbNits, displayPeak, highlightBlowout);
         float outLuma = dot(rgbNits, AUTOHDR_LUMA);
         float limitedLuma = applyHighlightPeakLimit(outLuma, displayPeak, highlightSoftness);
         rgbNits *= limitedLuma / max(outLuma, 1e-6);

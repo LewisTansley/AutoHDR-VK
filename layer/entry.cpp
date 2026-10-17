@@ -12,7 +12,9 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AutoHdrVk {
@@ -61,6 +63,102 @@ float encodingToOutputMode(OutputEncoding encoding)
         return 2.0f;
     default:
         return 0.0f;
+    }
+}
+
+bool isBgraSwapFormat(VkFormat format)
+{
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB
+        || format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 || format == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+}
+
+bool isRgb10PackedFormat(VkFormat format)
+{
+    return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
+VkFormat preferredRgb10Format(VkFormat requested)
+{
+    return isBgraSwapFormat(requested) ? VK_FORMAT_A2R10G10B10_UNORM_PACK32 : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+bool trySelectHdr10SwapchainFormat(VkFormat requested, const std::vector<VkSurfaceFormatKHR> &formats,
+                                   VkFormat &outFormat, VkColorSpaceKHR &outColorSpace)
+{
+    const VkFormat preferred = preferredRgb10Format(requested);
+
+    if (isRgb10PackedFormat(requested)) {
+        for (const auto &fmt : formats) {
+            if (fmt.format == requested && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                outFormat = fmt.format;
+                outColorSpace = fmt.colorSpace;
+                return true;
+            }
+        }
+        for (const auto &fmt : formats) {
+            if (fmt.format == preferred && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                outFormat = fmt.format;
+                outColorSpace = fmt.colorSpace;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    for (const auto &fmt : formats) {
+        if (fmt.format == requested && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            outFormat = fmt.format;
+            outColorSpace = fmt.colorSpace;
+            return true;
+        }
+    }
+    for (const auto &fmt : formats) {
+        if (fmt.format == preferred && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            outFormat = fmt.format;
+            outColorSpace = fmt.colorSpace;
+            return true;
+        }
+    }
+
+    const VkFormat fallback = preferred == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? VK_FORMAT_A2R10G10B10_UNORM_PACK32
+                                                                              : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    for (const auto &fmt : formats) {
+        if (fmt.format == fallback && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            outFormat = fmt.format;
+            outColorSpace = fmt.colorSpace;
+            return true;
+        }
+    }
+    for (const auto &fmt : formats) {
+        if (fmt.format == VK_FORMAT_R16G16B16A16_SFLOAT && fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            outFormat = fmt.format;
+            outColorSpace = fmt.colorSpace;
+            return true;
+        }
+    }
+    return false;
+}
+
+void populateSwapchainData(SwapchainData &sc, VkDevice device, VkSwapchainKHR swapchain,
+                           const VkSwapchainCreateInfoKHR &info, uint32_t queueFamily)
+{
+    sc.swapchain = swapchain;
+    sc.device = device;
+    sc.format = info.imageFormat;
+    sc.colorSpace = info.imageColorSpace;
+    sc.extent = info.imageExtent;
+    sc.queueFamily = queueFamily;
+    sc.hdrColorspace = isHdrColorSpace(info.imageColorSpace);
+    sc.encoding = resolveEncoding(info.imageColorSpace);
+    const bool formatIsSrgb = (info.imageFormat == VK_FORMAT_R8G8B8A8_SRGB
+                               || info.imageFormat == VK_FORMAT_B8G8R8A8_SRGB
+                               || info.imageFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
+    sc.inputIsSrgb = !formatIsSrgb && !sc.hdrColorspace;
+    if (sc.encoding == OutputEncoding::SdrPreview && !formatIsSrgb) {
+        sc.inputIsSrgb = true;
+    }
+    if (sc.hdrColorspace && sc.encoding == OutputEncoding::Pq && !formatIsSrgb) {
+        sc.inputIsSrgb = true;
     }
 }
 
@@ -302,6 +400,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, con
     LOAD(EndCommandBuffer);
     LOAD(CmdPipelineBarrier);
     LOAD(CmdCopyBufferToImage);
+    LOAD(CmdCopyBuffer);
     LOAD(CmdBindPipeline);
     LOAD(CmdBindDescriptorSets);
     LOAD(CmdDispatch);
@@ -355,11 +454,23 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocationCall
     if (dev) {
         destroy = dev->dispatch.DestroyDevice;
         {
-            std::lock_guard lock(dev->mutex);
-            for (auto &entry : dev->swapchains) {
-                destroySwapchainResources(dev, entry.second);
+            std::unique_lock lock(dev->mutex);
+            for (auto it = dev->swapchains.begin(); it != dev->swapchains.end();) {
+                while (it->second.presentRefs.load(std::memory_order_acquire) != 0) {
+                    lock.unlock();
+                    std::this_thread::yield();
+                    lock.lock();
+                    it = dev->swapchains.begin();
+                    if (it == dev->swapchains.end()) {
+                        break;
+                    }
+                }
+                if (it == dev->swapchains.end()) {
+                    break;
+                }
+                destroySwapchainResources(dev, it->second);
+                it = dev->swapchains.erase(it);
             }
-            dev->swapchains.clear();
             destroyDeviceResources(dev);
         }
         {
@@ -377,75 +488,75 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
                                                   const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
 {
     DeviceData *dev = getDeviceData(device);
-    if (!dev || !dev->dispatch.CreateSwapchainKHR) {
+    if (!dev || !dev->dispatch.CreateSwapchainKHR || !pCreateInfo || !pSwapchain) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    VkSwapchainCreateInfoKHR info = *pCreateInfo;
-    info.imageUsage = static_cast<VkImageUsageFlags>(info.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                                                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                                                     | VK_IMAGE_USAGE_SAMPLED_BIT
-                                                     | VK_IMAGE_USAGE_STORAGE_BIT);
+    const VkFormat origFormat = pCreateInfo->imageFormat;
+    const VkColorSpaceKHR origColorSpace = pCreateInfo->imageColorSpace;
 
-    // Prefer HDR10 colorspace when available and configured.
-    if (wantPreferHdrSwapchain() && pCreateInfo->surface
-        && dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR) {
+    auto *info = const_cast<VkSwapchainCreateInfoKHR *>(pCreateInfo);
+    info->imageUsage = static_cast<VkImageUsageFlags>(info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                                                      | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+
+    bool hdrRemapped = false;
+    if (wantSwapchainRemap() && pCreateInfo->surface && dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR) {
         uint32_t formatCount = 0;
         dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR(dev->physicalDevice, pCreateInfo->surface,
                                                                    &formatCount, nullptr);
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         dev->instance->dispatch.GetPhysicalDeviceSurfaceFormatsKHR(dev->physicalDevice, pCreateInfo->surface,
                                                                    &formatCount, formats.data());
-        for (const auto &fmt : formats) {
-            if (fmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
-                && (fmt.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmt.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32
-                    || fmt.format == VK_FORMAT_R16G16B16A16_SFLOAT || fmt.format == pCreateInfo->imageFormat)) {
-                // Keep app format when possible; only switch colorspace if format matches.
-                if (fmt.format == pCreateInfo->imageFormat || fmt.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
-                    || fmt.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
-                    info.imageFormat = fmt.format;
-                    info.imageColorSpace = fmt.colorSpace;
-                    logf("prefer HDR10 swapchain format=%u", static_cast<unsigned>(fmt.format));
-                    break;
-                }
+        VkFormat selectedFormat = info->imageFormat;
+        VkColorSpaceKHR selectedColorSpace = info->imageColorSpace;
+        if (trySelectHdr10SwapchainFormat(origFormat, formats, selectedFormat, selectedColorSpace)) {
+            if (selectedFormat != origFormat || selectedColorSpace != origColorSpace) {
+                info->imageFormat = selectedFormat;
+                info->imageColorSpace = selectedColorSpace;
+                hdrRemapped = true;
+                logf("prefer HDR10 swapchain: format %u cs %u -> format %u cs %u",
+                     static_cast<unsigned>(origFormat), static_cast<unsigned>(origColorSpace),
+                     static_cast<unsigned>(selectedFormat), static_cast<unsigned>(selectedColorSpace));
             }
         }
     }
 
-    const VkResult result = dev->dispatch.CreateSwapchainKHR(device, &info, pAllocator, pSwapchain);
+    VkResult result = dev->dispatch.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
     if (result != VK_SUCCESS) {
         return result;
     }
 
-    // Always create GPU resources so Super+H overlay works mid-session.
     SwapchainData sc{};
-    sc.swapchain = *pSwapchain;
-    sc.device = device;
-    sc.format = info.imageFormat;
-    sc.colorSpace = info.imageColorSpace;
-    sc.extent = info.imageExtent;
-    sc.queueFamily = dev->graphicsQueueFamily;
-    sc.hdrColorspace = isHdrColorSpace(info.imageColorSpace);
-    sc.encoding = resolveEncoding(info.imageColorSpace);
-    // UNORM/packed formats store sRGB-encoded bytes from typical SDR games.
-    // *_SRGB formats are linearized by the sampler, so skip shader sRGB decode.
-    const bool formatIsSrgb = (info.imageFormat == VK_FORMAT_R8G8B8A8_SRGB
-                               || info.imageFormat == VK_FORMAT_B8G8R8A8_SRGB
-                               || info.imageFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32);
-    sc.inputIsSrgb = !formatIsSrgb && !sc.hdrColorspace;
-    if (sc.encoding == OutputEncoding::SdrPreview && !formatIsSrgb) {
-        sc.inputIsSrgb = true;
-    }
-    // When we remapped to HDR10 but the app still draws SDR into the image, decode sRGB.
-    if (sc.hdrColorspace && sc.encoding == OutputEncoding::Pq && !formatIsSrgb) {
-        sc.inputIsSrgb = true;
-    }
+    populateSwapchainData(sc, device, *pSwapchain, *pCreateInfo, dev->graphicsQueueFamily);
 
     std::lock_guard lock(dev->mutex);
     if (!createSwapchainResources(dev, sc)) {
-        logf("failed to create swapchain resources; passthrough present");
-        sc.active = false;
+        if (hdrRemapped) {
+            logf("HDR swapchain resource init failed; recreating with original format %u cs %u",
+                 static_cast<unsigned>(origFormat), static_cast<unsigned>(origColorSpace));
+            dev->dispatch.DestroySwapchainKHR(device, *pSwapchain, pAllocator);
+
+            info->imageFormat = origFormat;
+            info->imageColorSpace = origColorSpace;
+
+            result = dev->dispatch.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+            if (result != VK_SUCCESS) {
+                return result;
+            }
+
+            sc = SwapchainData{};
+            populateSwapchainData(sc, device, *pSwapchain, *pCreateInfo, dev->graphicsQueueFamily);
+            if (!createSwapchainResources(dev, sc)) {
+                logf("failed to create swapchain resources after HDR revert; passthrough present");
+                sc.active = false;
+            }
+        } else {
+            logf("failed to create swapchain resources; passthrough present");
+            sc.active = false;
+        }
     }
+
     dev->swapchains[reinterpret_cast<uint64_t>(*pSwapchain)] = std::move(sc);
     return result;
 }
@@ -455,11 +566,24 @@ VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR s
 {
     DeviceData *dev = getDeviceData(device);
     if (dev) {
-        std::lock_guard lock(dev->mutex);
-        auto it = dev->swapchains.find(reinterpret_cast<uint64_t>(swapchain));
-        if (it != dev->swapchains.end()) {
-            destroySwapchainResources(dev, it->second);
-            dev->swapchains.erase(it);
+        {
+            std::unique_lock lock(dev->mutex);
+            auto it = dev->swapchains.find(reinterpret_cast<uint64_t>(swapchain));
+            if (it != dev->swapchains.end()) {
+                while (it->second.presentRefs.load(std::memory_order_acquire) != 0) {
+                    lock.unlock();
+                    std::this_thread::yield();
+                    lock.lock();
+                    it = dev->swapchains.find(reinterpret_cast<uint64_t>(swapchain));
+                    if (it == dev->swapchains.end()) {
+                        break;
+                    }
+                }
+                if (it != dev->swapchains.end()) {
+                    destroySwapchainResources(dev, it->second);
+                    dev->swapchains.erase(it);
+                }
+            }
         }
         if (dev->dispatch.DestroySwapchainKHR) {
             dev->dispatch.DestroySwapchainKHR(device, swapchain, pAllocator);
@@ -524,12 +648,18 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
 
     const bool effectOn = runtimeEffectOn();
     const bool drawOverlay = overlayVisible();
+    const AutoHdr::CalibrationSettings settings = effectiveSettings();
+    const bool hdrMetadataEnabled = wantHdrMetadata();
 
     VkPresentInfoKHR present = *pPresentInfo;
-    std::vector<VkSemaphore> waitSemaphores;
-    std::vector<VkSwapchainKHR> swapchains;
-    std::vector<uint32_t> imageIndices;
-    std::vector<VkResult> results;
+    thread_local std::vector<VkSemaphore> waitSemaphores;
+    thread_local std::vector<VkSwapchainKHR> swapchains;
+    thread_local std::vector<uint32_t> imageIndices;
+    thread_local std::vector<VkResult> results;
+    waitSemaphores.clear();
+    swapchains.clear();
+    imageIndices.clear();
+    results.clear();
 
     waitSemaphores.reserve(pPresentInfo->swapchainCount);
     swapchains.reserve(pPresentInfo->swapchainCount);
@@ -539,17 +669,25 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         const VkSwapchainKHR scHandle = pPresentInfo->pSwapchains[i];
         const uint32_t imageIndex = pPresentInfo->pImageIndices[i];
 
-        std::lock_guard lock(dev->mutex);
-        auto it = dev->swapchains.find(reinterpret_cast<uint64_t>(scHandle));
-        if (it == dev->swapchains.end() || !it->second.active) {
-            swapchains.push_back(scHandle);
-            imageIndices.push_back(imageIndex);
-            continue;
+        SwapchainData *scPtr = nullptr;
+        {
+            std::lock_guard lock(dev->mutex);
+            auto it = dev->swapchains.find(reinterpret_cast<uint64_t>(scHandle));
+            if (it == dev->swapchains.end() || !it->second.active) {
+                swapchains.push_back(scHandle);
+                imageIndices.push_back(imageIndex);
+                continue;
+            }
+            scPtr = &it->second;
+            scPtr->presentRefs.fetch_add(1, std::memory_order_acq_rel);
         }
 
         VkSemaphore signal = VK_NULL_HANDLE;
-        const bool ok = processPresent(dev, it->second, imageIndex, queue, pPresentInfo->waitSemaphoreCount,
-                                       pPresentInfo->pWaitSemaphores, signal, effectOn, drawOverlay);
+        const bool ok = processPresent(dev, *scPtr, imageIndex, queue, pPresentInfo->waitSemaphoreCount,
+                                       pPresentInfo->pWaitSemaphores, signal, effectOn, drawOverlay, settings,
+                                       hdrMetadataEnabled);
+        scPtr->presentRefs.fetch_sub(1, std::memory_order_acq_rel);
+
         if (!ok) {
             swapchains.push_back(scHandle);
             imageIndices.push_back(imageIndex);

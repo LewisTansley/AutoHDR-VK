@@ -23,50 +23,54 @@ float applyUserBlackPoint(float t, float offset)
     return max(t - offset, 0.0) / max(1.0 - offset, 1e-6);
 }
 
-// Histogram highlight pre-stretch: pull the top tail toward 1.0 when content white is below peak.
-// User black-floor crush is handled separately via applyUserBlackPoint().
-float adaptContentRange(float yRel, float p05, float p25, float contentWhite, float geoMean, float stretchStrength)
+// Monotonic highlight-tail remap using histogram-precomputed contentWhite / stretchOut.
+// Mids below the knee stay identity; only the top of the content-white band is lifted.
+float applyStretchRemap(float yRel, float shadowFloor, float contentWhite, float stretchOut)
 {
-    if (stretchStrength <= 1e-4) {
-        return clamp(yRel, 0.0, 1.0);
+    yRel = clamp(yRel, 0.0, 1.0);
+    if (stretchOut <= contentWhite + 1e-4) {
+        return yRel;
     }
-
-    float yw = clamp(max(contentWhite, 1e-3), 1e-3, 1.0);
-    if (yw >= 0.98) {
-        return clamp(yRel, 0.0, 1.0);
-    }
-
-    // Strength scales with how far detected content white sits below reference peak.
-    float whiteExpand = (1.0 - smoothstep(0.55, 0.98, yw)) * stretchStrength;
-    float expandFactor = clamp(whiteExpand, 0.0, 1.0);
-
-    if (expandFactor < 1e-4) {
-        return clamp(yRel, 0.0, 1.0);
-    }
-
-    float yWhiteOut = mix(yw, 1.0, expandFactor);
 
     // High knee for already-bright masters — only nudge the top tail.
-    float kneeMix = smoothstep(0.60, 0.95, yw);
-    float knee = mix(yw * 0.70, yw * 0.88, kneeMix);
-    float spanUpper = max(yw - knee, 1e-6);
-    float muted = 1.0 - smoothstep(0.55, 0.98, yw);
-    float maxGain = mix(1.25, 2.5, clamp(stretchStrength * 0.5, 0.0, 1.0));
-    maxGain = mix(maxGain, maxGain + 1.5, muted);
-    yWhiteOut = min(yWhiteOut, min(1.0, knee + spanUpper * maxGain));
-    yWhiteOut = max(yWhiteOut, yw);
+    float kneeMix = smoothstep(0.60, 0.95, contentWhite);
+    float knee = max(shadowFloor, mix(contentWhite * 0.70, contentWhite * 0.88, kneeMix));
 
     if (yRel <= knee) {
-        return clamp(yRel, 0.0, 1.0);
-    }
-    if (yRel <= yw) {
-        float t = (yRel - knee) / spanUpper;
-        return mix(knee, yWhiteOut, clamp(t, 0.0, 1.0));
+        return yRel;
     }
 
-    // Above content white: expand [yw, 1.0] -> [yWhiteOut, 1.0], never compress.
-    float t = clamp((yRel - yw) / max(1.0 - yw, 1e-3), 0.0, 1.0);
-    return max(mix(yWhiteOut, 1.0, t), yRel);
+    if (yRel <= contentWhite) {
+        float t = (yRel - knee) / max(contentWhite - knee, 1e-3);
+        return mix(knee, stretchOut, clamp(t, 0.0, 1.0));
+    }
+
+    // Above content white: expand [contentWhite, 1] → [stretchOut, 1], never compress.
+    float t = (yRel - contentWhite) / max(1.0 - contentWhite, 1e-3);
+    return max(mix(stretchOut, 1.0, clamp(t, 0.0, 1.0)), yRel);
+}
+
+// Monotonic highlight separation via multiplicative log gain that only rises with yRel.
+// Avoids range-compressing pow remaps (those posterize highlights after PQ quantize) and
+// avoids peak-hold inversion. Soften still owns absolute panel peak.
+float applySeparationBoost(float yRel, float mid, float hi, float amount)
+{
+    amount = clamp(amount, 0.0, 1.0);
+    if (amount <= 1e-4) {
+        return yRel;
+    }
+
+    yRel = max(yRel, 0.0);
+    mid = clamp(mid, 1e-3, 0.95);
+    hi = max(hi, mid + 1e-3);
+
+    // 0 below mid → 1 at/above hi; never falls, so gain never inverts order.
+    float recovery = smoothstep(mid, hi, yRel);
+    recovery = pow(recovery, mix(1.0, 1.35, amount));
+
+    // Mild mid flatten (~−0.05 stop) → gentle highlight punch (~0.85 stop ≈ 1.8×).
+    float logBoost = mix(mix(0.0, -0.05, amount), mix(0.0, 0.85, amount), recovery);
+    return yRel * exp2(logBoost * amount);
 }
 
 vec3 srgbToLinear(vec3 c)
@@ -331,4 +335,39 @@ float applyHighlightPeakLimit(float outLuma, float displayPeak, float softness)
         return softHighlightShoulder(outLuma, displayPeak, softness);
     }
     return min(outLuma, displayPeak);
+}
+
+// RenoDX-style highlight blowout: luma-preserving ICtCp chroma reduction near display peak only.
+vec3 applyHighlightBlowout(vec3 rgbNits, float displayPeak, float blowout)
+{
+    if (blowout <= 1e-4) {
+        return rgbNits;
+    }
+
+    float yIn = max(luminanceYNits(rgbNits), 1e-6);
+    float peak = max(displayPeak, 1e-6);
+
+    // Knee mirrors softHighlightShoulder: only desaturate the top highlight tail.
+    float kneeStart = mix(peak * 0.92, peak * 0.72, blowout);
+    if (yIn <= kneeStart) {
+        return rgbNits;
+    }
+
+    float t = (yIn - kneeStart) / max(peak - kneeStart, 1e-6);
+    float desat = pow(clamp(t, 0.0, 1.0), mix(1.8, 0.65, blowout)) * blowout;
+    float chromaMul = 1.0 - desat;
+    if (chromaMul >= 1.0 - 1e-4) {
+        return rgbNits;
+    }
+
+    vec3 ictcp = linearRgbToICtCp(rgbNits);
+    ictcp.y *= chromaMul;
+    ictcp.z *= chromaMul;
+
+    vec3 mapped = softPullPositiveRgb(iCtCpToLinearRgb(ictcp));
+    float yMapped = luminanceYNits(mapped);
+    if (!(yMapped > 1e-6) || any(isnan(mapped)) || any(isinf(mapped))) {
+        return rgbNits;
+    }
+    return mapped * (yIn / yMapped);
 }
